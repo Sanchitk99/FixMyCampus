@@ -1,0 +1,9 @@
+{
+  "name": "fixmycampus",
+  "version": "1.0.0",
+  "description": "University ticketing system for reporting and resolving campus civic issues.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
