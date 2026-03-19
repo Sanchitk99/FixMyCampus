@@ -87,6 +87,7 @@ function initializeDatabase() {
       author_user_id INTEGER NOT NULL,
       message TEXT NOT NULL,
       status TEXT,
+      image_data TEXT,
       created_at TEXT NOT NULL,
       FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE,
       FOREIGN KEY (author_user_id) REFERENCES users (id) ON DELETE CASCADE
@@ -97,6 +98,7 @@ function initializeDatabase() {
       ticket_id INTEGER NOT NULL,
       reporter_user_id INTEGER NOT NULL,
       message TEXT NOT NULL,
+      image_data TEXT,
       created_at TEXT NOT NULL,
       FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE,
       FOREIGN KEY (reporter_user_id) REFERENCES users (id) ON DELETE CASCADE
@@ -126,6 +128,26 @@ function initializeDatabase() {
       FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE,
       FOREIGN KEY (ticket_update_id) REFERENCES ticket_updates (id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS support_conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      requester_user_id INTEGER NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'open',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (requester_user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL,
+      sender_user_id INTEGER NOT NULL,
+      message TEXT,
+      image_data TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (conversation_id) REFERENCES support_conversations (id) ON DELETE CASCADE,
+      FOREIGN KEY (sender_user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
   `);
 }
 
@@ -138,6 +160,8 @@ function ensureSchema() {
   ensureColumn("users", "campus_address", "TEXT");
   ensureColumn("users", "bio", "TEXT");
   ensureColumn("users", "profile_image_data", "TEXT");
+  ensureColumn("ticket_updates", "image_data", "TEXT");
+  ensureColumn("ticket_reports", "image_data", "TEXT");
 }
 
 function ensureColumn(tableName, columnName, columnDefinition) {
@@ -391,19 +415,19 @@ function createTicket(ticket) {
   return Number(result.lastInsertRowid);
 }
 
-function addTicketUpdate({ ticketId, authorUserId, message, status, createdAt }) {
+function addTicketUpdate({ ticketId, authorUserId, message, status, imageData, createdAt }) {
   const result = db.prepare(`
-    INSERT INTO ticket_updates (ticket_id, author_user_id, message, status, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(ticketId, authorUserId, message, status || null, createdAt);
+    INSERT INTO ticket_updates (ticket_id, author_user_id, message, status, image_data, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(ticketId, authorUserId, message, status || null, imageData || null, createdAt);
   return Number(result.lastInsertRowid);
 }
 
-function addTicketReport({ ticketId, reporterUserId, message, createdAt }) {
+function addTicketReport({ ticketId, reporterUserId, message, imageData, createdAt }) {
   db.prepare(`
-    INSERT INTO ticket_reports (ticket_id, reporter_user_id, message, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(ticketId, reporterUserId, message, createdAt);
+    INSERT INTO ticket_reports (ticket_id, reporter_user_id, message, image_data, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(ticketId, reporterUserId, message, imageData || null, createdAt);
 }
 
 function upsertTicketFeedback({ ticketId, reporterUserId, rating, comment, createdAt }) {
@@ -423,6 +447,45 @@ function addNotification({ userId, ticketId, ticketUpdateId, type, message, crea
     INSERT INTO notifications (user_id, ticket_id, ticket_update_id, type, message, is_read, created_at)
     VALUES (?, ?, ?, ?, ?, 0, ?)
   `).run(userId, ticketId, ticketUpdateId || null, type, message, createdAt);
+  return Number(result.lastInsertRowid);
+}
+
+function ensureSupportConversation(requesterUserId) {
+  const existing = db.prepare(`
+    SELECT *
+    FROM support_conversations
+    WHERE requester_user_id = ?
+  `).get(requesterUserId);
+
+  if (existing) {
+    return existing;
+  }
+
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    INSERT INTO support_conversations (requester_user_id, status, created_at, updated_at)
+    VALUES (?, 'open', ?, ?)
+  `).run(requesterUserId, now, now);
+
+  return db.prepare(`
+    SELECT *
+    FROM support_conversations
+    WHERE id = ?
+  `).get(Number(result.lastInsertRowid));
+}
+
+function addSupportMessage({ conversationId, senderUserId, message, imageData, createdAt }) {
+  const result = db.prepare(`
+    INSERT INTO support_messages (conversation_id, sender_user_id, message, image_data, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(conversationId, senderUserId, message || null, imageData || null, createdAt);
+
+  db.prepare(`
+    UPDATE support_conversations
+    SET updated_at = ?, status = 'open'
+    WHERE id = ?
+  `).run(createdAt, conversationId);
+
   return Number(result.lastInsertRowid);
 }
 
@@ -522,7 +585,12 @@ function getUserById(userId) {
 
 function getTicketById(ticketId) {
   return db.prepare(`
-    SELECT tickets.*, users.full_name AS owner_name
+    SELECT
+      tickets.*,
+      users.full_name AS owner_name,
+      users.email AS owner_email,
+      users.department AS owner_department,
+      users.role AS owner_role
     FROM tickets
     JOIN users ON users.id = tickets.owner_user_id
     WHERE tickets.id = ?
@@ -593,6 +661,75 @@ function markNotificationRead(notificationId, userId) {
     SET is_read = 1
     WHERE id = ? AND user_id = ?
   `).run(notificationId, userId);
+}
+
+function getSupportConversationById(conversationId) {
+  return db.prepare(`
+    SELECT
+      support_conversations.*,
+      users.full_name AS requester_name,
+      users.email AS requester_email,
+      users.department AS requester_department,
+      users.role AS requester_role
+    FROM support_conversations
+    JOIN users ON users.id = support_conversations.requester_user_id
+    WHERE support_conversations.id = ?
+  `).get(conversationId);
+}
+
+function getSupportConversationForUser(userId) {
+  return db.prepare(`
+    SELECT
+      support_conversations.*,
+      users.full_name AS requester_name,
+      users.email AS requester_email,
+      users.department AS requester_department,
+      users.role AS requester_role
+    FROM support_conversations
+    JOIN users ON users.id = support_conversations.requester_user_id
+    WHERE support_conversations.requester_user_id = ?
+  `).get(userId);
+}
+
+function getSupportConversationsForAdmin() {
+  return db.prepare(`
+    SELECT
+      support_conversations.*,
+      users.full_name AS requester_name,
+      users.email AS requester_email,
+      users.department AS requester_department,
+      users.role AS requester_role,
+      (
+        SELECT support_messages.message
+        FROM support_messages
+        WHERE support_messages.conversation_id = support_conversations.id
+        ORDER BY datetime(support_messages.created_at) DESC, support_messages.id DESC
+        LIMIT 1
+      ) AS last_message,
+      (
+        SELECT support_messages.image_data
+        FROM support_messages
+        WHERE support_messages.conversation_id = support_conversations.id
+        ORDER BY datetime(support_messages.created_at) DESC, support_messages.id DESC
+        LIMIT 1
+      ) AS last_image
+    FROM support_conversations
+    JOIN users ON users.id = support_conversations.requester_user_id
+    ORDER BY datetime(support_conversations.updated_at) DESC, support_conversations.id DESC
+  `).all();
+}
+
+function getSupportMessages(conversationId) {
+  return db.prepare(`
+    SELECT
+      support_messages.*,
+      users.full_name AS sender_name,
+      users.role AS sender_role
+    FROM support_messages
+    JOIN users ON users.id = support_messages.sender_user_id
+    WHERE support_messages.conversation_id = ?
+    ORDER BY datetime(support_messages.created_at) ASC, support_messages.id ASC
+  `).all(conversationId);
 }
 
 function getTicketStats(user) {
@@ -794,6 +931,29 @@ function notifyProgressUpdate(ticket, actorUser, updateId, updateMessage, nextSt
 
 function assignmentLabel(ticket) {
   return ticket.assigned_department || "Pending Admin Assignment";
+}
+
+function reporterDisplayLabel(viewer, reporterUserId, reporterName, reporterRole = "") {
+  if (viewer.role === "admin") {
+    return reporterRole ? `${reporterName} (${roleLabel(reporterRole)})` : reporterName;
+  }
+  if (Number(viewer.id) === Number(reporterUserId)) {
+    return "You";
+  }
+  return "Anonymous Reporter";
+}
+
+function renderReporterIdentityLine(viewer, ticket) {
+  if (viewer.role === "admin") {
+    return `<p class="reporter-detail-line">Reporter: ${escapeHtml(ticket.owner_name)} · ${escapeHtml(ticket.owner_email)} · ${escapeHtml(ticket.owner_department)} · ${escapeHtml(roleLabel(ticket.owner_role))}</p>`;
+  }
+  if (Number(viewer.id) === Number(ticket.owner_user_id)) {
+    return `<p class="reporter-detail-line">Reporter: You</p>`;
+  }
+  if (viewer.role === "department") {
+    return `<p class="reporter-detail-line">Reporter: Anonymous</p>`;
+  }
+  return "";
 }
 
 function suggestedDepartment(category) {
@@ -1062,7 +1222,7 @@ function renderNotificationBell(user, notifications, unreadCount) {
   `;
 }
 
-function renderAppShell({ title, user, currentNav, filters, searchValue, content }) {
+function renderAppShell({ title, user, currentNav, filters, searchValue, content, currentPath }) {
   const notifications = getNotificationsForUser(user.id, 5);
   const unreadNotificationCount = getUnreadNotificationCount(user.id);
 
@@ -1076,6 +1236,7 @@ function renderAppShell({ title, user, currentNav, filters, searchValue, content
           ${renderSidebar(currentNav, filters || { query: "", categories: [], statuses: [], priorities: [] }, user)}
           <main class="content-area">${content}</main>
         </div>
+        ${renderSupportDrawer(user, currentPath || "/tickets")}
         <footer class="app-footer">
           <div>
             <strong>FixMyCampus · University Facilities</strong>
@@ -1178,6 +1339,9 @@ function renderSidebar(currentNav, filters, user) {
         <h2>Support</h2>
         <p>Report a problem with the site or get help from Facilities.</p>
         <a href="#">Contact Facilities</a>
+        <button class="support-chat-trigger" type="button" data-open-support-drawer>
+          ${user.role === "admin" ? "Open Admin Support Inbox" : "Contact Admin Support"}
+        </button>
       </section>
     </aside>
   `;
@@ -1190,6 +1354,166 @@ function renderTicketImage(ticket, large = false) {
 
   const fallbackClass = ticket.category === "Electrical" ? "corridor-thumb" : "leaking-thumb";
   return `<div class="ticket-thumb ${large ? "large" : ""} ${fallbackClass}" aria-hidden="true"></div>`;
+}
+
+function renderEvidenceImage(imageData, altText) {
+  if (!imageData) {
+    return "";
+  }
+
+  return `
+    <div class="evidence-image-wrap">
+      <img class="evidence-image" src="${imageData}" alt="${escapeHtml(altText)}">
+    </div>
+  `;
+}
+
+function renderSupportMessageImage(imageData, altText) {
+  if (!imageData) {
+    return "";
+  }
+
+  return `<img class="support-message-image" src="${imageData}" alt="${escapeHtml(altText)}">`;
+}
+
+function renderSupportMessageBubble(message, currentUser) {
+  const isOwn = Number(message.sender_user_id) === Number(currentUser.id);
+  const isAdminSender = message.sender_role === "admin";
+  const senderLabel = isOwn
+    ? "You"
+    : isAdminSender
+      ? "Admin Support"
+      : currentUser.role === "admin"
+        ? `${message.sender_name} (${roleLabel(message.sender_role)})`
+        : "Requester";
+
+  return `
+    <article class="support-message ${isOwn ? "own" : ""}">
+      <div class="support-message-bubble">
+        <div class="support-message-head">
+          <strong>${escapeHtml(senderLabel)}</strong>
+          <span>${escapeHtml(formatRelative(message.created_at))}</span>
+        </div>
+        ${message.message ? `<p>${escapeHtml(message.message)}</p>` : ""}
+        ${renderSupportMessageImage(message.image_data, `${senderLabel} support attachment`)}
+      </div>
+    </article>
+  `;
+}
+
+function renderSupportComposer(conversation, currentUser, returnTo, hashTarget, placeholder) {
+  return `
+    <form class="support-composer" action="/support/messages" method="POST">
+      <input type="hidden" name="conversationId" value="${escapeHtml(String(conversation.id))}">
+      <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+      <input type="hidden" name="hashTarget" value="${escapeHtml(hashTarget)}">
+      <div class="support-input-shell">
+        <textarea name="message" placeholder="${escapeHtml(placeholder)}"></textarea>
+        <div class="support-composer-toolbar">
+          <div class="support-attachment-group">
+            <input type="file" accept="image/*" class="hidden-file-input" data-upload-input>
+            <input type="hidden" name="imageData" value="" data-upload-hidden>
+            <button class="support-attachment-trigger" type="button" aria-label="Attach image" data-upload-zone>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 7h-3.2l-1.6-2H9.8L8.2 7H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Zm-7 9a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-6.2A2.2 2.2 0 1 0 12 14a2.2 2.2 0 0 0 0-4.2Z"/></svg>
+            </button>
+            <span class="support-attachment-label" data-upload-label>Attach image</span>
+            <div class="support-inline-preview upload-preview" data-upload-preview></div>
+          </div>
+          <button class="primary-button compact" type="submit">Send Message</button>
+        </div>
+      </div>
+    </form>
+  `;
+}
+
+function renderUserSupportDrawer(user, currentPath) {
+  const conversation = ensureSupportConversation(user.id);
+  const fullConversation = getSupportConversationForUser(user.id);
+  const messages = getSupportMessages(conversation.id);
+  const chatBody = messages.length > 0
+    ? messages.map((message) => renderSupportMessageBubble(message, user)).join("")
+    : '<div class="support-empty">Start a direct conversation with admin support from here.</div>';
+
+  return `
+    <div class="support-drawer-backdrop" data-support-backdrop></div>
+    <aside class="support-drawer" data-support-drawer>
+      <div class="support-drawer-header">
+        <div>
+          <strong>Admin Support</strong>
+          <span>Direct help for account or campus issue escalation</span>
+        </div>
+        <button class="support-drawer-close" type="button" aria-label="Close admin support chat" data-close-support-drawer>&times;</button>
+      </div>
+      <div class="support-chat-wrap">
+        <div class="support-chat-meta">
+          <strong>${escapeHtml(fullConversation.requester_name)}</strong>
+          <span>${escapeHtml(roleLabel(user.role))} · ${escapeHtml(user.department)}</span>
+        </div>
+        <div class="support-messages">${chatBody}</div>
+        ${renderSupportComposer(fullConversation, user, currentPath, "#support-chat", "Write a message to admin support...")}
+      </div>
+    </aside>
+  `;
+}
+
+function renderAdminSupportDrawer(user, currentPath) {
+  const conversations = getSupportConversationsForAdmin();
+  const activeConversation = conversations[0] || null;
+  const listMarkup = conversations.length > 0
+    ? conversations.map((conversation, index) => `
+        <button class="support-conversation-item ${index === 0 ? "active" : ""}" type="button" data-support-conversation-trigger data-conversation-id="${escapeHtml(String(conversation.id))}">
+          <strong>${escapeHtml(conversation.requester_name)}</strong>
+          <span>${escapeHtml(conversation.requester_department)} · ${escapeHtml(roleLabel(conversation.requester_role))}</span>
+          <small>${escapeHtml(truncateText(conversation.last_message || (conversation.last_image ? "Sent an image attachment." : "No messages yet."), 60))}</small>
+        </button>
+      `).join("")
+    : '<div class="support-empty">No support conversations yet.</div>';
+
+  const panelMarkup = conversations.length > 0
+    ? conversations.map((conversation, index) => {
+        const messages = getSupportMessages(conversation.id);
+        const bodyMarkup = messages.length > 0
+          ? messages.map((message) => renderSupportMessageBubble(message, user)).join("")
+          : '<div class="support-empty">No messages in this conversation yet.</div>';
+
+        return `
+          <section class="support-conversation-panel ${index === 0 ? "active" : ""}" data-support-conversation-panel data-conversation-id="${escapeHtml(String(conversation.id))}">
+            <div class="support-chat-meta admin">
+              <div>
+                <strong>${escapeHtml(conversation.requester_name)}</strong>
+                <span>${escapeHtml(conversation.requester_email)} · ${escapeHtml(conversation.requester_department)} · ${escapeHtml(roleLabel(conversation.requester_role))}</span>
+              </div>
+            </div>
+            <div class="support-messages">${bodyMarkup}</div>
+            ${renderSupportComposer(conversation, user, currentPath, `#support-chat-${conversation.id}`, `Reply to ${conversation.requester_name}...`)}
+          </section>
+        `;
+      }).join("")
+    : '<div class="support-conversation-panel active"><div class="support-empty">Open support conversations will appear here once users start chatting.</div></div>';
+
+  return `
+    <div class="support-drawer-backdrop" data-support-backdrop></div>
+    <aside class="support-drawer admin" data-support-drawer>
+      <div class="support-drawer-header">
+        <div>
+          <strong>Admin Support Inbox</strong>
+          <span>${escapeHtml(String(conversations.length))} conversation${conversations.length === 1 ? "" : "s"}</span>
+        </div>
+        <button class="support-drawer-close" type="button" aria-label="Close admin support inbox" data-close-support-drawer>&times;</button>
+      </div>
+      <div class="support-admin-layout">
+        <div class="support-conversation-list">${listMarkup}</div>
+        <div class="support-conversation-panels">${panelMarkup}</div>
+      </div>
+    </aside>
+  `;
+}
+
+function renderSupportDrawer(user, currentPath) {
+  if (user.role === "admin") {
+    return renderAdminSupportDrawer(user, currentPath);
+  }
+  return renderUserSupportDrawer(user, currentPath);
 }
 
 function renderLoginPage(message = "") {
@@ -1320,6 +1644,7 @@ function renderTicketsPage(user, tickets, stats, filters) {
     currentNav: "tickets",
     filters,
     searchValue: filters.query,
+    currentPath: "/tickets",
     content: `
       <section class="stats-grid">
         ${renderStatCard("Total Tickets", stats.total, "pale-blue", '<path d="M8 4h8v2H8V4Zm-2 3h12v13H6V7Zm2 3v2h4v-2H8Zm0 4v2h6v-2H8Z"/>')}
@@ -1351,6 +1676,7 @@ function renderCreateTicketPage(user, values = {}, message = "", type = "error")
     currentNav: "create",
     filters: { query: "", categories: [], statuses: [], priorities: [] },
     searchValue: "",
+    currentPath: "/tickets/new",
     content: `
       <section class="page-heading stacked">
         <div>
@@ -1442,6 +1768,7 @@ function renderProfilePage(user, values = {}, message = "", type = "success") {
     currentNav: "profile",
     filters: { query: "", categories: [], statuses: [], priorities: [] },
     searchValue: "",
+    currentPath: "/profile",
     content: `
       <section class="page-heading stacked">
         <div>
@@ -1551,6 +1878,7 @@ function renderNotificationsPage(user, notifications) {
     currentNav: "tickets",
     filters: { query: "", categories: [], statuses: [], priorities: [] },
     searchValue: "",
+    currentPath: "/notifications",
     content: `
       <section class="page-heading stacked">
         <div>
@@ -1594,6 +1922,17 @@ function renderTicketControlPanel(user, ticket, message, type) {
         ${renderFlash(message, type)}
         <form action="/tickets/${ticket.id}/updates" method="POST">
           <textarea name="message" placeholder="Add Progress Update"></textarea>
+          <label class="upload-label compact-upload-label">
+            <span>Attach Fix Image</span>
+            <input type="file" accept="image/*" class="hidden-file-input" data-upload-input>
+            <input type="hidden" name="imageData" value="" data-upload-hidden>
+            <div class="upload-zone compact-upload-zone" data-upload-zone>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 7h-3.2l-1.6-2H9.8L8.2 7H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Zm-7 9a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-6.2A2.2 2.2 0 1 0 12 14a2.2 2.2 0 0 0 0-4.2Z"/></svg>
+              <strong data-upload-label>Upload Fix Photo</strong>
+              <p>Attach a photo showing the repair or on-site progress.</p>
+              <div class="upload-preview" data-upload-preview></div>
+            </div>
+          </label>
           <div class="staff-update-actions">
             <select name="status">
               <option value="">Update Ticket Status</option>
@@ -1622,10 +1961,11 @@ function renderReporterEscalationSection(user, ticket, updates, reports, message
     ? reports.map((report) => `
         <article class="report-item">
           <div class="report-item-head">
-            <strong>${escapeHtml(report.reporter_name)}</strong>
+            <strong>${escapeHtml(reporterDisplayLabel(user, report.reporter_user_id, report.reporter_name, report.reporter_role))}</strong>
             <span>${escapeHtml(formatRelative(report.created_at))}</span>
           </div>
           <p>${escapeHtml(report.message)}</p>
+          ${renderEvidenceImage(report.image_data, `Reporter evidence for ticket ${ticket.code}`)}
         </article>
       `).join("")
     : `<p class="panel-helper">No reporter concerns have been raised for this ticket.</p>`;
@@ -1645,6 +1985,17 @@ function renderReporterEscalationSection(user, ticket, updates, reports, message
           ${hasDepartmentProgress(updates) ? `
             <form action="/tickets/${ticket.id}/reports" method="POST" class="report-form">
               <textarea name="message" placeholder="Explain which department update looks incorrect and why."></textarea>
+              <label class="upload-label compact-upload-label">
+                <span>Attach Image Evidence</span>
+                <input type="file" accept="image/*" class="hidden-file-input" data-upload-input>
+                <input type="hidden" name="imageData" value="" data-upload-hidden>
+                <div class="upload-zone compact-upload-zone" data-upload-zone>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 7h-3.2l-1.6-2H9.8L8.2 7H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Zm-7 9a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-6.2A2.2 2.2 0 1 0 12 14a2.2 2.2 0 0 0 0-4.2Z"/></svg>
+                  <strong data-upload-label>Upload Evidence Photo</strong>
+                  <p>Show why the resolution or update is incorrect.</p>
+                  <div class="upload-preview" data-upload-preview></div>
+                </div>
+              </label>
               <div class="report-form-actions">
                 <button class="primary-button compact" type="submit">Report to Admin</button>
               </div>
@@ -1718,6 +2069,7 @@ function renderTicketDetailPage(user, ticket, updates, reports, feedback, contro
     currentNav: "tickets",
     filters: { query: "", categories: [], statuses: [], priorities: [] },
     searchValue: "",
+    currentPath: `/tickets/${ticket.id}`,
     content: `
       <div class="detail-page">
         <section class="detail-summary-card">
@@ -1725,6 +2077,7 @@ function renderTicketDetailPage(user, ticket, updates, reports, feedback, contro
             <span class="detail-ticket-id">Ticket #${escapeHtml(ticket.code)}</span>
             <h1>${escapeHtml(ticket.title)}</h1>
             <p>Category: ${escapeHtml(ticket.category)} <span>Priority: ${escapeHtml(priorityLabel(ticket.priority || "medium"))}</span> <span>Location: ${escapeHtml(ticket.location)}</span> <span>Assigned: ${escapeHtml(assignmentLabel(ticket))}</span> <span>Reported: ${escapeHtml(formatRelative(ticket.created_at))}</span></p>
+            ${renderReporterIdentityLine(user, ticket)}
           </div>
           <div class="status-pill status-${escapeHtml(ticket.status)}">${escapeHtml(statusLabel(ticket.status).toUpperCase())}</div>
         </section>
@@ -1748,14 +2101,15 @@ function renderTicketDetailPage(user, ticket, updates, reports, feedback, contro
                     <button class="mini-avatar" type="button" aria-label="Reporter">
                       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm0 2c-4 0-7 2-7 4.5V20h14v-1.5C19 16 16 14 12 14Z"/></svg>
                     </button>
-                  ` : ""}
-                  <div class="${update.author_role === "student" ? "timeline-card-body" : ""}">
-                    <span>${escapeHtml(formatRelative(update.created_at))}</span>
-                    <strong>${escapeHtml(update.message)}</strong>
-                  </div>
-                </article>
-              `).join("")}
-            </div>
+                ` : ""}
+                <div class="${update.author_role === "student" ? "timeline-card-body" : ""}">
+                  <span>${escapeHtml(formatRelative(update.created_at))}</span>
+                  <strong>${escapeHtml(update.message)}</strong>
+                  ${renderEvidenceImage(update.image_data, `${update.author_name} evidence for ticket ${ticket.code}`)}
+                </div>
+              </article>
+            `).join("")}
+          </div>
           </div>
 
           <div class="detail-side-column">
@@ -1982,6 +2336,51 @@ async function handleRequest(request, response) {
 
   if (request.method === "GET" && pathname === "/notifications") {
     sendHtml(response, renderNotificationsPage(user, getNotificationsForUser(user.id, 100)));
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/support/messages") {
+    const form = await parseRequestBody(request);
+    const conversationId = Number(form.conversationId || 0);
+    const message = String(form.message || "").trim();
+    const imageData = String(form.imageData || "").trim();
+    const returnTo = String(form.returnTo || "/tickets").startsWith("/") ? String(form.returnTo || "/tickets") : "/tickets";
+    const hashTarget = String(form.hashTarget || "#support-chat").startsWith("#") ? String(form.hashTarget || "#support-chat") : "#support-chat";
+
+    if (!message && !imageData) {
+      redirect(response, `${returnTo}${hashTarget}`);
+      return;
+    }
+
+    if (imageData && !imageData.startsWith("data:image/")) {
+      sendText(response, "Uploaded support image format is invalid.", 400);
+      return;
+    }
+
+    const conversation = getSupportConversationById(conversationId);
+    if (!conversation) {
+      sendText(response, "Support conversation not found.", 404);
+      return;
+    }
+
+    const canAccessConversation = user.role === "admin"
+      ? true
+      : Number(conversation.requester_user_id) === Number(user.id);
+
+    if (!canAccessConversation) {
+      sendText(response, "You cannot post to this support conversation.", 403);
+      return;
+    }
+
+    addSupportMessage({
+      conversationId,
+      senderUserId: user.id,
+      message,
+      imageData,
+      createdAt: new Date().toISOString()
+    });
+
+    redirect(response, `${returnTo}${hashTarget}`);
     return;
   }
 
@@ -2238,6 +2637,7 @@ async function handleRequest(request, response) {
     const form = await parseRequestBody(request);
     const message = String(form.message || "").trim();
     const nextStatus = String(form.status || "").trim();
+    const imageData = String(form.imageData || "").trim();
 
     if (!message && !nextStatus) {
       const updates = getTicketUpdates(ticketId);
@@ -2255,6 +2655,14 @@ async function handleRequest(request, response) {
       return;
     }
 
+    if (imageData && !imageData.startsWith("data:image/")) {
+      const updates = getTicketUpdates(ticketId);
+      const reports = getTicketReports(ticketId);
+      const feedback = getTicketFeedback(ticketId);
+      sendHtml(response, renderTicketDetailPage(user, ticket, updates, reports, feedback, "Uploaded proof image format is invalid."), 400);
+      return;
+    }
+
     const appliedStatus = nextStatus || ticket.status;
     const now = new Date().toISOString();
 
@@ -2263,6 +2671,7 @@ async function handleRequest(request, response) {
       authorUserId: user.id,
       message: message || `Ticket status changed to ${statusLabel(appliedStatus)}`,
       status: appliedStatus,
+      imageData,
       createdAt: now
     });
 
@@ -2302,9 +2711,16 @@ async function handleRequest(request, response) {
 
     const form = await parseRequestBody(request);
     const message = String(form.message || "").trim();
+    const imageData = String(form.imageData || "").trim();
     if (!message) {
       const feedback = getTicketFeedback(ticketId);
       sendHtml(response, renderTicketDetailPage(user, ticket, updates, reports, feedback, "", "error", "Please explain why you believe the department update is incorrect."), 400);
+      return;
+    }
+
+    if (imageData && !imageData.startsWith("data:image/")) {
+      const feedback = getTicketFeedback(ticketId);
+      sendHtml(response, renderTicketDetailPage(user, ticket, updates, reports, feedback, "", "error", "Uploaded evidence image format is invalid."), 400);
       return;
     }
 
@@ -2312,6 +2728,7 @@ async function handleRequest(request, response) {
       ticketId,
       reporterUserId: user.id,
       message,
+      imageData,
       createdAt: new Date().toISOString()
     });
 

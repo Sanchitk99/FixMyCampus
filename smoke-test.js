@@ -10,6 +10,8 @@ const { startServer } = require("./server");
   const { server, port } = await startServer(0);
   const base = `http://127.0.0.1:${port}`;
   const sampleProfileImage = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2232%22%20fill%3D%22%232f73d8%22/%3E%3Ccircle%20cx%3D%2232%22%20cy%3D%2225%22%20r%3D%2212%22%20fill%3D%22white%22/%3E%3Cpath%20d%3D%22M14%2054c4-10%2014-15%2018-15s14%205%2018%2015%22%20fill%3D%22white%22/%3E%3C/svg%3E";
+  const sampleUpdateImage = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2216%22%20fill%3D%22%23e8f3ff%22/%3E%3Cpath%20d%3D%22M22%2062l14-15%2014%2011%2016-20%208%2010v18H22Z%22%20fill%3D%22%232f73d8%22/%3E%3Ccircle%20cx%3D%2237%22%20cy%3D%2234%22%20r%3D%228%22%20fill%3D%22%235abf7d%22/%3E%3C/svg%3E";
+  const sampleReportImage = "data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2216%22%20fill%3D%22%23fff0f0%22/%3E%3Cpath%20d%3D%22M24%2068h48l-9-15-11%209-12-18-16%2024Z%22%20fill%3D%22%23d95f5f%22/%3E%3Ccircle%20cx%3D%2268%22%20cy%3D%2232%22%20r%3D%228%22%20fill%3D%22%23f0b24e%22/%3E%3C/svg%3E";
 
   try {
     let response = await fetch(`${base}/`);
@@ -33,6 +35,32 @@ const { startServer } = require("./server");
     });
     const ticketsHtml = await response.text();
     console.log("tickets", response.status, ticketsHtml.includes("My Tickets"), ticketsHtml.includes("Leaking vents in BLA-210"));
+
+    const supportConversationMatch = ticketsHtml.match(/name="conversationId" value="(\d+)"/);
+    console.log("support-drawer", response.status, ticketsHtml.includes("Contact Admin Support"), Boolean(supportConversationMatch));
+
+    if (!supportConversationMatch) {
+      throw new Error("Expected support conversation hidden field in support drawer.");
+    }
+
+    const supportConversationId = supportConversationMatch[1];
+
+    response = await fetch(`${base}/support/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        cookie: studentCookie
+      },
+      body: new URLSearchParams({
+        conversationId: supportConversationId,
+        returnTo: "/tickets",
+        hashTarget: "#support-chat",
+        message: "I need direct help from admin support regarding this campus issue.",
+        imageData: sampleReportImage
+      }),
+      redirect: "manual"
+    });
+    console.log("support-message", response.status, response.headers.get("location"));
 
     response = await fetch(`${base}/profile`, {
       method: "POST",
@@ -125,6 +153,35 @@ const { startServer } = require("./server");
     console.log("admin-login", response.status, Boolean(adminCookie));
 
     response = await fetch(`${base}/tickets`, {
+      headers: { cookie: adminCookie }
+    });
+    const adminTicketsHtml = await response.text();
+    console.log(
+      "admin-support-inbox",
+      response.status,
+      adminTicketsHtml.includes("Open Admin Support Inbox"),
+      adminTicketsHtml.includes("I need direct help from admin support regarding this campus issue."),
+      adminTicketsHtml.includes("Shashwat Gupta")
+    );
+
+    response = await fetch(`${base}/support/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        cookie: adminCookie
+      },
+      body: new URLSearchParams({
+        conversationId: supportConversationId,
+        returnTo: "/tickets",
+        hashTarget: `#support-chat-${supportConversationId}`,
+        message: "Admin support is reviewing your concern now.",
+        imageData: ""
+      }),
+      redirect: "manual"
+    });
+    console.log("admin-support-reply", response.status, response.headers.get("location"));
+
+    response = await fetch(`${base}/tickets`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -166,6 +223,18 @@ const { startServer } = require("./server");
     const departmentCookie = (response.headers.get("set-cookie") || "").split(";")[0];
     console.log("department-login", response.status, Boolean(departmentCookie));
 
+    response = await fetch(`${base}${detailPath}`, {
+      headers: { cookie: departmentCookie }
+    });
+    const departmentDetailHtml = await response.text();
+    console.log(
+      "department-anonymous",
+      response.status,
+      departmentDetailHtml.includes("Reporter: Anonymous"),
+      !departmentDetailHtml.includes("Shashwat Gupta"),
+      !departmentDetailHtml.includes("student@fixmycampus.edu")
+    );
+
     response = await fetch(`${base}${detailPath}/updates`, {
       method: "POST",
       headers: {
@@ -174,7 +243,8 @@ const { startServer } = require("./server");
       },
       body: new URLSearchParams({
         message: "Maintenance has been notified.",
-        status: "resolved"
+        status: "resolved",
+        imageData: sampleUpdateImage
       }),
       redirect: "manual"
     });
@@ -190,6 +260,7 @@ const { startServer } = require("./server");
       ticketsWithNotificationHtml.includes('href="/notifications"'),
       ticketsWithNotificationHtml.includes('class="badge">1<')
     );
+    console.log("support-reply-visible", ticketsWithNotificationHtml.includes("Admin support is reviewing your concern now."));
 
     response = await fetch(`${base}/notifications`, {
       headers: { cookie: studentCookie }
@@ -232,7 +303,8 @@ const { startServer } = require("./server");
         cookie: studentCookie
       },
       body: new URLSearchParams({
-        message: "The department update is inaccurate. No one has visited the hostel block yet."
+        message: "The department update is inaccurate. No one has visited the hostel block yet.",
+        imageData: sampleReportImage
       }),
       redirect: "manual"
     });
@@ -249,7 +321,9 @@ const { startServer } = require("./server");
       updatedHtml.includes("RESOLVED"),
       updatedHtml.includes("Assigned: Plumbing Department"),
       updatedHtml.includes("The department update is inaccurate. No one has visited the hostel block yet."),
-      updatedHtml.includes("Priority: High")
+      updatedHtml.includes("Priority: High"),
+      updatedHtml.includes(sampleUpdateImage),
+      updatedHtml.includes(sampleReportImage)
     );
 
     response = await fetch(`${base}${detailPath}/feedback`, {
@@ -295,7 +369,13 @@ const { startServer } = require("./server");
       headers: { cookie: adminCookie }
     });
     const adminDetailHtml = await response.text();
-    console.log("admin-sees-report", response.status, adminDetailHtml.includes("The department update is inaccurate. No one has visited the hostel block yet."));
+    console.log(
+      "admin-sees-report",
+      response.status,
+      adminDetailHtml.includes("The department update is inaccurate. No one has visited the hostel block yet."),
+      adminDetailHtml.includes("Reporter: Shashwat Gupta"),
+      adminDetailHtml.includes("student@fixmycampus.edu")
+    );
   } finally {
     server.close();
   }

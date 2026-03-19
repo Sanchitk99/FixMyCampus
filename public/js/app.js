@@ -1,10 +1,11 @@
 document.addEventListener("DOMContentLoaded", () => {
-  const uploadZone = document.querySelector("[data-upload-zone]");
-  const fileInput = document.querySelector("[data-upload-input]");
-  const hiddenInput = document.querySelector("[data-upload-hidden]");
-  const preview = document.querySelector("[data-upload-preview]");
-  const label = document.querySelector("[data-upload-label]");
   const sidebarFilterForm = document.querySelector("[data-sidebar-filters]");
+  const supportDrawer = document.querySelector("[data-support-drawer]");
+  const supportBackdrop = document.querySelector("[data-support-backdrop]");
+  const supportOpenButtons = document.querySelectorAll("[data-open-support-drawer]");
+  const supportCloseButtons = document.querySelectorAll("[data-close-support-drawer]");
+  const supportConversationTriggers = document.querySelectorAll("[data-support-conversation-trigger]");
+  const supportConversationPanels = document.querySelectorAll("[data-support-conversation-panel]");
 
   if (sidebarFilterForm) {
     sidebarFilterForm.querySelectorAll("input[type='checkbox']").forEach((checkbox) => {
@@ -14,68 +15,158 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  if (!uploadZone || !fileInput || !hiddenInput) {
-    return;
+  const setActiveSupportConversation = (conversationId) => {
+    if (!conversationId) {
+      return;
+    }
+
+    supportConversationTriggers.forEach((trigger) => {
+      trigger.classList.toggle("active", trigger.getAttribute("data-conversation-id") === conversationId);
+    });
+
+    supportConversationPanels.forEach((panel) => {
+      panel.classList.toggle("active", panel.getAttribute("data-conversation-id") === conversationId);
+    });
+  };
+
+  const openSupportDrawer = (conversationId = "") => {
+    if (!supportDrawer || !supportBackdrop) {
+      return;
+    }
+
+    supportDrawer.classList.add("is-open");
+    supportBackdrop.classList.add("is-open");
+    document.body.classList.add("support-drawer-open");
+
+    if (conversationId) {
+      setActiveSupportConversation(conversationId);
+    }
+  };
+
+  const closeSupportDrawer = () => {
+    if (!supportDrawer || !supportBackdrop) {
+      return;
+    }
+
+    supportDrawer.classList.remove("is-open");
+    supportBackdrop.classList.remove("is-open");
+    document.body.classList.remove("support-drawer-open");
+
+    if (window.location.hash.startsWith("#support-chat")) {
+      history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    }
+  };
+
+  supportOpenButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      openSupportDrawer();
+    });
+  });
+
+  supportCloseButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      closeSupportDrawer();
+    });
+  });
+
+  if (supportBackdrop) {
+    supportBackdrop.addEventListener("click", () => {
+      closeSupportDrawer();
+    });
   }
 
-  const syncUploadPreview = (dataUrl, fileName) => {
-    hiddenInput.value = dataUrl || "";
+  supportConversationTriggers.forEach((trigger) => {
+    trigger.addEventListener("click", () => {
+      const conversationId = trigger.getAttribute("data-conversation-id") || "";
+      setActiveSupportConversation(conversationId);
+      if (conversationId) {
+        history.replaceState(null, "", `${window.location.pathname}${window.location.search}#support-chat-${conversationId}`);
+      }
+    });
+  });
 
-    if (!preview) {
+  const hash = window.location.hash || "";
+  if (hash === "#support-chat") {
+    openSupportDrawer();
+  } else if (hash.startsWith("#support-chat-")) {
+    openSupportDrawer(hash.replace("#support-chat-", ""));
+  }
+
+  document.querySelectorAll("[data-upload-zone]").forEach((uploadZone) => {
+    const wrapper = uploadZone.closest("label, .upload-label, form, section") || uploadZone.parentElement;
+    const fileInput = wrapper?.querySelector("[data-upload-input]");
+    const hiddenInput = wrapper?.querySelector("[data-upload-hidden]");
+    const preview = wrapper?.querySelector("[data-upload-preview]");
+    const label = wrapper?.querySelector("[data-upload-label]");
+
+    if (!fileInput || !hiddenInput) {
       return;
     }
 
-    preview.innerHTML = "";
+    const defaultLabel = label?.textContent || "";
 
-    if (!dataUrl) {
-      return;
-    }
+    const syncUploadPreview = (dataUrl, fileName) => {
+      hiddenInput.value = dataUrl || "";
 
-    const image = document.createElement("img");
-    image.src = dataUrl;
-    image.alt = "Ticket upload preview";
-    image.className = "upload-preview-image";
-    preview.appendChild(image);
+      if (!preview) {
+        return;
+      }
 
-    if (label && fileName) {
-      label.textContent = `[ ${fileName} ]`;
-    }
-  };
+      preview.innerHTML = "";
 
-  const readFile = (file) => {
-    if (!file || !file.type.startsWith("image/")) {
-      return;
-    }
+      if (!dataUrl) {
+        if (label) {
+          label.textContent = defaultLabel;
+        }
+        return;
+      }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      syncUploadPreview(String(reader.result || ""), file.name);
+      const image = document.createElement("img");
+      image.src = dataUrl;
+      image.alt = "Upload preview";
+      image.className = "upload-preview-image";
+      preview.appendChild(image);
+
+      if (label && fileName) {
+        label.textContent = fileName;
+      }
     };
-    reader.readAsDataURL(file);
-  };
 
-  uploadZone.addEventListener("click", () => {
-    fileInput.click();
-  });
+    const readFile = (file) => {
+      if (!file || !file.type.startsWith("image/")) {
+        return;
+      }
 
-  uploadZone.addEventListener("dragover", (event) => {
-    event.preventDefault();
-    uploadZone.classList.add("is-dragging");
-  });
+      const reader = new FileReader();
+      reader.onload = () => {
+        syncUploadPreview(String(reader.result || ""), file.name);
+      };
+      reader.readAsDataURL(file);
+    };
 
-  uploadZone.addEventListener("dragleave", () => {
-    uploadZone.classList.remove("is-dragging");
-  });
+    uploadZone.addEventListener("click", () => {
+      fileInput.click();
+    });
 
-  uploadZone.addEventListener("drop", (event) => {
-    event.preventDefault();
-    uploadZone.classList.remove("is-dragging");
-    const file = event.dataTransfer?.files?.[0];
-    readFile(file);
-  });
+    uploadZone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      uploadZone.classList.add("is-dragging");
+    });
 
-  fileInput.addEventListener("change", () => {
-    const file = fileInput.files?.[0];
-    readFile(file);
+    uploadZone.addEventListener("dragleave", () => {
+      uploadZone.classList.remove("is-dragging");
+    });
+
+    uploadZone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      uploadZone.classList.remove("is-dragging");
+      const file = event.dataTransfer?.files?.[0];
+      readFile(file);
+    });
+
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      readFile(file);
+    });
   });
 });

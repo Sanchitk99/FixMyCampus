@@ -1,6 +1,6 @@
 # FixMyCampus
 
-<<<<<<< HEAD
+
 =======
 FixMyCampus is a campus issue reporting and resolution system for universities. It lets students and faculty report civic or maintenance issues, allows an admin to assign each ticket to the correct department, and enables departments to post progress updates while keeping the original reporter informed.
 
@@ -200,4 +200,4 @@ The smoke test covers:
 - File uploads stored outside the database
 - Department performance analytics
 - SLA tracking and overdue ticket alerts
->>>>>>> c427afe (Save before fixing branch)
+
