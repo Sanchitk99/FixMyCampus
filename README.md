@@ -1,7 +1,6 @@
 # FixMyCampus
 
 
-=======
 FixMyCampus is a campus issue reporting and resolution system for universities. It lets students and faculty report civic or maintenance issues, allows an admin to assign each ticket to the correct department, and enables departments to post progress updates while keeping the original reporter informed.
 
 The current version is a working Node.js application with SQLite persistence, role-based access, seeded demo accounts, and a campus-focused ticket workflow.
