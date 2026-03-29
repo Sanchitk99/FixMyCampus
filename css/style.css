@@ -564,6 +564,37 @@ textarea {
   border: 1px solid #d9e3f2;
 }
 
+.theme-toggle-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: 1px solid #d9e3f2;
+  background: #fff;
+  color: #3d6eae;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.theme-toggle-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 16px rgba(70, 97, 143, 0.16);
+}
+
+.theme-toggle-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.auth-theme-toggle {
+  margin-right: 4px;
+}
+
 .account-link {
   margin: 14px 0 0;
   text-align: center;
@@ -1207,6 +1238,154 @@ textarea {
   margin: 18px 28px 0;
   padding-left: 26px;
   padding-right: 18px;
+}
+
+:root[data-theme="dark"] {
+  --bg: #000000;
+  --panel: #111111;
+  --line: #2b2b2b;
+  --line-strong: #3a3a3a;
+  --text: #f5f5f5;
+  --muted: #b8b8b8;
+  --blue: #f2f2f2;
+  --blue-dark: #d6d6d6;
+  --blue-soft: #151515;
+  --shadow: 0 12px 28px rgba(0, 0, 0, 0.38);
+}
+
+:root[data-theme="dark"] body {
+  color: var(--text);
+  background: linear-gradient(180deg, #000000 0%, #090909 100%);
+}
+
+:root[data-theme="dark"] .brand-mark {
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .auth-header,
+:root[data-theme="dark"] .app-header,
+:root[data-theme="dark"] .auth-footer,
+:root[data-theme="dark"] .app-footer,
+:root[data-theme="dark"] .sidebar,
+:root[data-theme="dark"] .stat-card,
+:root[data-theme="dark"] .ticket-card,
+:root[data-theme="dark"] .form-card,
+:root[data-theme="dark"] .detail-summary-card,
+:root[data-theme="dark"] .detail-issue-card,
+:root[data-theme="dark"] .timeline-card,
+:root[data-theme="dark"] .staff-update-card,
+:root[data-theme="dark"] .notification-preview,
+:root[data-theme="dark"] .notification-page-item {
+  background: rgba(18, 18, 18, 0.94) !important;
+  border-color: var(--line) !important;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+}
+
+:root[data-theme="dark"] .header-tagline,
+:root[data-theme="dark"] .page-heading p,
+:root[data-theme="dark"] .login-copy p,
+:root[data-theme="dark"] .profile-meta span,
+:root[data-theme="dark"] .ticket-card p,
+:root[data-theme="dark"] .detail-summary-card p,
+:root[data-theme="dark"] .notification-preview-head span,
+:root[data-theme="dark"] .notification-preview-item span,
+:root[data-theme="dark"] .notification-preview-item small {
+  color: #b8b8b8;
+}
+
+:root[data-theme="dark"] .sidebar-nav a,
+:root[data-theme="dark"] .filter-group label,
+:root[data-theme="dark"] .support-card p {
+  color: #f0f0f0;
+}
+
+:root[data-theme="dark"] .sidebar-nav a.current,
+:root[data-theme="dark"] .sidebar-nav a:hover {
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .sidebar-nav svg {
+  color: #f0f0f0;
+}
+
+:root[data-theme="dark"] .filter-group h2,
+:root[data-theme="dark"] .support-card h2 {
+  color: #d0d0d0;
+}
+
+:root[data-theme="dark"] .support-card a {
+  color: #ffffff;
+}
+
+:root[data-theme="dark"] .top-links a,
+:root[data-theme="dark"] .footer-links a,
+:root[data-theme="dark"] .header-center-link,
+:root[data-theme="dark"] .text-button,
+:root[data-theme="dark"] .notification-preview-link {
+  color: #f0f0f0;
+}
+
+:root[data-theme="dark"] .search-bar {
+  background: linear-gradient(180deg, #121212 0%, #171717 100%);
+}
+
+:root[data-theme="dark"] .search-bar input {
+  color: #f3f3f3;
+}
+
+:root[data-theme="dark"] .login-form input,
+:root[data-theme="dark"] .ticket-form input,
+:root[data-theme="dark"] .ticket-form select,
+:root[data-theme="dark"] .ticket-form textarea,
+:root[data-theme="dark"] .staff-update-card textarea,
+:root[data-theme="dark"] .staff-update-card select {
+  border-color: var(--line-strong);
+  background: linear-gradient(180deg, #101010 0%, #171717 100%);
+  color: #f2f2f2;
+}
+
+:root[data-theme="dark"] .checkbox-row {
+  color: #b8b8b8;
+}
+
+:root[data-theme="dark"] .icon-button,
+:root[data-theme="dark"] .avatar-button,
+:root[data-theme="dark"] .mini-avatar,
+:root[data-theme="dark"] .theme-toggle-button,
+:root[data-theme="dark"] .ghost-button {
+  background: #171717;
+  border-color: #3c3c3c;
+  color: #f2f2f2;
+}
+
+:root[data-theme="dark"] .primary-button {
+  background: linear-gradient(180deg, #2f77dc 0%, #2d6ed1 100%);
+  color: #ffffff;
+  box-shadow: 0 10px 18px rgba(47, 115, 216, 0.26);
+}
+
+:root[data-theme="dark"] .theme-toggle-button:hover,
+:root[data-theme="dark"] .ghost-button:hover,
+:root[data-theme="dark"] .icon-button:hover,
+:root[data-theme="dark"] .avatar-button:hover {
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35);
+}
+
+:root[data-theme="dark"] .badge {
+  background: #f2f2f2;
+  color: #000000;
+}
+
+:root[data-theme="dark"] .support-status-pill {
+  background: #1a1a1a !important;
+  color: #f5f5f5 !important;
+  border: 1px solid #3a3a3a;
+}
+
+:root[data-theme="dark"] .empty-state p,
+:root[data-theme="dark"] .app-footer p,
+:root[data-theme="dark"] .auth-footer p {
+  color: #b8b8b8;
 }
 
 @media (max-width: 1180px) {

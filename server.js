@@ -262,11 +262,11 @@ function normalizeLegacyData() {
 function seedDatabase() {
   const now = Date.now();
   const studentId = ensureUser({
-    fullName: "Shashwat Gupta",
+    fullName: "Name",
     email: "student@fixmycampus.edu",
     password: "password123",
     role: "student",
-    department: "Computer Science"
+    department: "Course"
   });
   const facultyId = ensureUser({
     fullName: "Professor Meera Rao",
@@ -1783,7 +1783,11 @@ function parseUniversityEmail(email) {
   const hasSingleAt = parts.length === 2;
   const localPart = hasSingleAt ? parts[0] : "";
   const domainPart = hasSingleAt ? parts[1] : "";
-  const isUniversityDomain = Boolean(localPart && domainPart && domainPart === UNIVERSITY_EMAIL_DOMAIN);
+  const isUniversityDomain = Boolean(
+    localPart
+    && domainPart
+    && (domainPart === UNIVERSITY_EMAIL_DOMAIN || domainPart.endsWith(`.${UNIVERSITY_EMAIL_DOMAIN}`))
+  );
   const isStudentFormat = /^s\d{2}[a-z]{3,8}\d{4}$/i.test(localPart);
 
   return {
@@ -1920,6 +1924,74 @@ function renderFlash(message, type = "error") {
   return `<div class="flash-banner ${type}">${escapeHtml(message)}</div>`;
 }
 
+function renderThemeBootScriptTag() {
+  return `
+    <script>
+      (function () {
+        try {
+          var key = "fixmycampus_theme";
+          var stored = localStorage.getItem(key);
+          var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var theme = (stored === "dark" || stored === "light") ? stored : (prefersDark ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (error) {}
+      })();
+    </script>
+  `;
+}
+
+function renderThemeControllerScriptTag() {
+  return `
+    <script>
+      (function () {
+        var key = "fixmycampus_theme";
+        var root = document.documentElement;
+
+        function getTheme() {
+          return root.getAttribute("data-theme") === "dark" ? "dark" : "light";
+        }
+
+        function syncThemeUi(theme) {
+          var isDark = theme === "dark";
+          document.querySelectorAll("[data-theme-toggle]").forEach(function (button) {
+            button.setAttribute("aria-pressed", String(isDark));
+          });
+          document.querySelectorAll("[data-theme-toggle-label]").forEach(function (label) {
+            label.textContent = isDark ? "Light mode" : "Dark mode";
+          });
+        }
+
+        function setTheme(theme, persist) {
+          root.setAttribute("data-theme", theme);
+          if (persist) {
+            try {
+              localStorage.setItem(key, theme);
+            } catch (error) {}
+          }
+          syncThemeUi(theme);
+        }
+
+        document.addEventListener("click", function (event) {
+          var toggle = event.target.closest("[data-theme-toggle]");
+          if (!toggle) {
+            return;
+          }
+          event.preventDefault();
+          setTheme(getTheme() === "dark" ? "light" : "dark", true);
+        });
+
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", function () {
+            syncThemeUi(getTheme());
+          });
+        } else {
+          syncThemeUi(getTheme());
+        }
+      })();
+    </script>
+  `;
+}
+
 function renderDocument(title, bodyClass, content, { includeAppScript = false } = {}) {
   return `
     <!DOCTYPE html>
@@ -1930,9 +2002,11 @@ function renderDocument(title, bodyClass, content, { includeAppScript = false } 
         <title>${escapeHtml(title)}</title>
         <link rel="stylesheet" href="/css/style.css">
         <link rel="stylesheet" href="/app-extra.css">
+        ${renderThemeBootScriptTag()}
       </head>
       <body class="${escapeHtml(bodyClass)}">
         ${content}
+        ${renderThemeControllerScriptTag()}
         ${includeAppScript ? '<script src="/js/app.js"></script>' : ""}
       </body>
     </html>
@@ -1963,6 +2037,16 @@ function renderUserAvatar(user, className = "avatar-button", ariaLabel = "Profil
     <span class="${className}" aria-label="${escapeHtml(ariaLabel)}">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm0 2c-4 0-7 2-7 4.5V20h14v-1.5C19 16 16 14 12 14Z"/></svg>
     </span>
+  `;
+}
+
+function renderThemeToggleButton(extraClass = "") {
+  const className = extraClass ? `theme-toggle-button ${extraClass}` : "theme-toggle-button";
+  return `
+    <button class="${className}" type="button" data-theme-toggle aria-pressed="false">
+      <span class="theme-toggle-icon" aria-hidden="true">◐</span>
+      <span data-theme-toggle-label>Dark mode</span>
+    </button>
   `;
 }
 
@@ -2022,6 +2106,7 @@ function renderAuthPage({ title, heading, subheading, formMarkup }) {
             <span class="header-tagline">Report and track campus issues easily.</span>
           </div>
           <nav class="top-links" aria-label="Top links">
+            ${renderThemeToggleButton("auth-theme-toggle")}
             <a href="#">Help Center</a>
             <a href="#">Contact IT</a>
           </nav>
@@ -2140,6 +2225,7 @@ function renderAppHeader(user, searchValue, notifications, unreadNotificationCou
       </form>
       <div class="header-center-link">Campus Resources</div>
       <div class="header-actions">
+        ${renderThemeToggleButton()}
         ${renderNotificationBell(user, notifications, unreadNotificationCount)}
         ${canCreateTicket(user) ? '<a class="primary-button compact" href="/tickets/new">Create New Ticket</a>' : ""}
         <div class="profile-header-group">
@@ -2462,8 +2548,6 @@ function renderSupportDrawer(user, currentPath) {
 }
 
 function renderLoginPage(message = "", type = "error", values = {}) {
-  const ssoEntryPath = getUniversitySsoEntryPath();
-  const ssoLabel = isMicrosoftSsoConfigured() ? "Continue with Microsoft Entra ID" : "Sign in with University SSO";
   const formMarkup = `
     <form class="login-form" action="/login" method="POST">
       ${renderFlash(message, type)}
@@ -2483,7 +2567,6 @@ function renderLoginPage(message = "", type = "error", values = {}) {
         <a href="/resend-verification">Resend verification email</a>
       </div>
       <button class="primary-button" type="submit">Log in</button>
-      <a class="ghost-button" href="${ssoEntryPath}">${ssoLabel}</a>
       <div class="demo-box">
         <strong>Demo Accounts</strong>
         <p>Student: <code>student@fixmycampus.edu</code> / <code>password123</code></p>
@@ -2508,9 +2591,9 @@ function renderSignupPage(message = "", values = {}) {
     <form class="login-form" action="/signup" method="POST">
       ${renderFlash(message)}
       <label for="fullName">Full name</label>
-      <input id="fullName" name="fullName" type="text" value="${escapeHtml(values.fullName || "")}" placeholder="Shashwat Gupta" required>
+      <input id="fullName" name="fullName" type="text" value="${escapeHtml(values.fullName || "")}" placeholder="Name" required>
       <label for="department">Department / Course</label>
-      <input id="department" name="department" type="text" value="${escapeHtml(values.department || "")}" placeholder="Computer Science" required>
+      <input id="department" name="department" type="text" value="${escapeHtml(values.department || "")}" placeholder="Course" required>
       <label for="accountRole">Account type</label>
       <select id="accountRole" name="accountRole" required>
         <option value="student" ${values.accountRole === "student" || !values.accountRole ? "selected" : ""}>Student</option>
@@ -2518,7 +2601,6 @@ function renderSignupPage(message = "", values = {}) {
       </select>
       <label for="signupEmail">University email</label>
       <input id="signupEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="s24cseu0458@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
-      <p class="account-link">Student format: <code>s24cseu0458@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}</code>. Faculty: any non-student address on the same domain.</p>
       <label for="signupPassword">Password</label>
       <input id="signupPassword" name="password" type="password" placeholder="Create a password" required>
       <label for="confirmPassword">Confirm password</label>
@@ -2607,14 +2689,14 @@ function renderForgotPasswordPage(message = "", type = "error", values = {}) {
 function renderUniversitySsoPage(message = "", type = "error", values = {}) {
   return renderAuthPage({
     title: "FixMyCampus | University SSO",
-    heading: "University SSO sign-in",
-    subheading: "Enter your university email and we will generate a one-time sign-in link for this demo.",
+    heading: "Sign in to continue",
+    subheading: "Enter your university email to receive a one-time sign-in link.",
     formMarkup: `
       <form class="login-form" action="/university-sso" method="POST">
         ${renderFlash(message, type)}
         <label for="ssoEmail">University email</label>
         <input id="ssoEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="name@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
-        <button class="primary-button" type="submit">Generate sign-in link</button>
+        <button class="primary-button" type="submit">Continue</button>
         <p class="account-link"><a href="/">Back to sign in</a></p>
       </form>
     `
@@ -3679,74 +3761,27 @@ async function handleRequest(request, response) {
   }
 
   if (request.method === "GET" && pathname === "/university-sso") {
-    if (user) {
-      redirect(response, "/tickets");
-      return;
-    }
-    sendHtml(response, renderUniversitySsoPage());
+    redirect(response, "/");
     return;
   }
 
   if (request.method === "POST" && pathname === "/university-sso") {
-    const form = await parseRequestBody(request);
-    const email = String(form.email || "").trim().toLowerCase();
-
-    if (!email) {
-      sendHtml(response, renderUniversitySsoPage("University email is required.", "error", { email }), 400);
-      return;
-    }
-
-    const parsedEmail = parseUniversityEmail(email);
-    if (!parsedEmail.isUniversityDomain) {
-      sendHtml(
-        response,
-        renderUniversitySsoPage(`Use your university email ending with @${UNIVERSITY_EMAIL_DOMAIN}.`, "error", { email }),
-        400
-      );
-      return;
-    }
-
-    const foundUser = getUserByEmail(email);
-    if (!foundUser) {
-      sendHtml(response, renderUniversitySsoPage("No account exists for that university email. Create an account first.", "error", { email }), 404);
-      return;
-    }
-
-    if (!foundUser.email_verified) {
-      const verificationToken = issueEmailVerificationForUser(foundUser.id);
-      const verificationLink = buildAbsoluteUrl(request, `/verify-email?token=${verificationToken}`);
-      sendHtml(response, renderVerificationSentPage(email, verificationLink), 403);
-      return;
-    }
-
-    const ssoToken = issueSsoLoginForUser(foundUser.id);
-    const signInLink = buildAbsoluteUrl(request, `/university-sso/complete?token=${ssoToken}`);
-    sendHtml(response, renderUniversitySsoReadyPage(email, signInLink));
+    redirect(response, "/");
     return;
   }
 
   if (request.method === "GET" && pathname === "/university-sso/complete") {
-    const token = String(url.searchParams.get("token") || "").trim();
-    const foundUser = getUserBySsoLoginToken(token);
-
-    if (!foundUser || !isTokenValid(foundUser.sso_login_sent_at, UNIVERSITY_SSO_TTL_MS)) {
-      sendHtml(response, renderUniversitySsoPage("That university SSO link is invalid or has expired. Request a new sign-in link.", "error"), 400);
-      return;
-    }
-
-    clearSsoLoginForUser(foundUser.id);
-    const sessionId = createSession(foundUser.id);
-    redirect(response, "/tickets", [setSessionCookie(sessionId)]);
+    redirect(response, "/");
     return;
   }
 
   if (request.method === "GET" && pathname === "/auth/microsoft/start") {
-    redirect(response, "/university-sso");
+    redirect(response, "/");
     return;
   }
 
   if (request.method === "GET" && pathname === MICROSOFT_CALLBACK_PATH) {
-    redirect(response, "/university-sso");
+    redirect(response, "/");
     return;
   }
 

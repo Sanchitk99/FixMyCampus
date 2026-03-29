@@ -1671,3 +1671,83 @@
     padding-top: 0;
   }
 }
+
+:root[data-theme="dark"] .report-section-card,
+:root[data-theme="dark"] .support-drawer,
+:root[data-theme="dark"] .support-conversation-list,
+:root[data-theme="dark"] .support-conversation-panel,
+:root[data-theme="dark"] .support-chat-meta,
+:root[data-theme="dark"] .support-composer,
+:root[data-theme="dark"] .support-message-bubble,
+:root[data-theme="dark"] .support-input-shell,
+:root[data-theme="dark"] .support-conversation-item,
+:root[data-theme="dark"] .support-status-form,
+:root[data-theme="dark"] .profile-summary-card,
+:root[data-theme="dark"] .profile-detail-item,
+:root[data-theme="dark"] .profile-bio-card,
+:root[data-theme="dark"] .profile-avatar-actions,
+:root[data-theme="dark"] .profile-image-dialog,
+:root[data-theme="dark"] .complaint-feed-card,
+:root[data-theme="dark"] .complaint-feed-item,
+:root[data-theme="dark"] .feedback-summary {
+  background: rgba(18, 18, 18, 0.95) !important;
+  border-color: #333333 !important;
+  color: #f2f2f2;
+}
+
+:root[data-theme="dark"] .profile-avatar-hint,
+:root[data-theme="dark"] .panel-helper,
+:root[data-theme="dark"] .support-empty,
+:root[data-theme="dark"] .support-chat-meta span,
+:root[data-theme="dark"] .support-conversation-item span,
+:root[data-theme="dark"] .support-conversation-item small,
+:root[data-theme="dark"] .report-item p,
+:root[data-theme="dark"] .complaint-feed-card p,
+:root[data-theme="dark"] .profile-summary-card p,
+:root[data-theme="dark"] .profile-summary-meta span,
+:root[data-theme="dark"] .profile-detail-item span,
+:root[data-theme="dark"] .profile-bio-card span {
+  color: #b8b8b8 !important;
+}
+
+:root[data-theme="dark"] .profile-avatar-edit-trigger,
+:root[data-theme="dark"] .profile-image-close {
+  background: rgba(0, 0, 0, 0.88);
+}
+
+:root[data-theme="dark"] .profile-image-backdrop {
+  background: rgba(0, 0, 0, 0.78);
+}
+
+:root[data-theme="dark"] .report-form textarea,
+:root[data-theme="dark"] .report-form select,
+:root[data-theme="dark"] .support-composer textarea,
+:root[data-theme="dark"] .support-status-form select {
+  border-color: #3c3c3c;
+  background: linear-gradient(180deg, #101010 0%, #171717 100%);
+  color: #f2f2f2;
+}
+
+:root[data-theme="dark"] .upload-zone,
+:root[data-theme="dark"] .upload-zone.compact-upload-zone {
+  border-color: #3c3c3c;
+  background: linear-gradient(180deg, #111111 0%, #171717 100%);
+}
+
+:root[data-theme="dark"] .support-linked-ticket,
+:root[data-theme="dark"] .support-linked-ticket-row a,
+:root[data-theme="dark"] .complaint-feed-item a,
+:root[data-theme="dark"] .profile-readonly-card .text-button {
+  color: #f0f0f0;
+}
+
+:root[data-theme="dark"] .support-chat-trigger {
+  border-color: #d6e3f6;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+  color: #2f73d8;
+}
+
+:root[data-theme="dark"] .logout-link,
+:root[data-theme="dark"] .profile-meta-link span {
+  color: #f0f0f0;
+}
