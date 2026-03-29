@@ -4,13 +4,37 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 
-const HOST = "127.0.0.1";
-const DEFAULT_PORT = Number(process.env.PORT || 3000);
+const HOST = String(process.env.HOST || "localhost").trim();
+const PORT = Number(process.env.PORT || 3000);
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const DB_PATH = process.env.FIXMYCAMPUS_DB_PATH || path.join(DATA_DIR, "fixmycampus.db");
+const FIXMYCAMPUS_BASE_URL = String(process.env.FIXMYCAMPUS_BASE_URL || "").trim().replace(/\/+$/, "");
 const SESSION_COOKIE = "fixmycampus_session";
+const MICROSOFT_OAUTH_COOKIE = "fixmycampus_microsoft_oauth";
 const MAX_BODY_SIZE = 8 * 1024 * 1024;
+const EMAIL_VERIFICATION_TTL_MS = 1000 * 60 * 60 * 24;
+const PASSWORD_RESET_TTL_MS = 1000 * 60 * 30;
+const UNIVERSITY_SSO_TTL_MS = 1000 * 60 * 15;
+const MICROSOFT_OAUTH_TTL_MS = 1000 * 60 * 10;
+const MICROSOFT_CALLBACK_PATH = "/auth/microsoft/callback";
+const MICROSOFT_SCOPE = "openid profile email";
+const MICROSOFT_CLIENT_ID = String(process.env.MICROSOFT_CLIENT_ID || "").trim();
+const MICROSOFT_TENANT_ID = String(process.env.MICROSOFT_TENANT_ID || "").trim();
+const MICROSOFT_CLIENT_SECRET = String(process.env.MICROSOFT_CLIENT_SECRET || "").trim();
+const MICROSOFT_REDIRECT_URI = String(process.env.MICROSOFT_REDIRECT_URI || "").trim();
+const UNIVERSITY_EMAIL_DOMAIN = String(process.env.UNIVERSITY_EMAIL_DOMAIN || "bennett.edu.in").trim().toLowerCase();
+const LEGACY_DEMO_EMAILS = new Set([
+  "student@fixmycampus.edu",
+  "faculty@fixmycampus.edu",
+  "admin@fixmycampus.edu",
+  "plumbing@fixmycampus.edu",
+  "electrical@fixmycampus.edu",
+  "safety@fixmycampus.edu",
+  "internet@fixmycampus.edu",
+  "cleanliness@fixmycampus.edu",
+  "facilities@fixmycampus.edu"
+]);
 const CATEGORY_OPTIONS = [
   "Plumbing",
   "Electrical",
@@ -21,6 +45,8 @@ const CATEGORY_OPTIONS = [
 ];
 const STATUS_OPTIONS = ["open", "in_progress", "resolved"];
 const PRIORITY_OPTIONS = ["low", "medium", "high", "emergency"];
+const SUPPORT_STATUS_OPTIONS = ["open", "in_review", "waiting_for_user", "resolved"];
+const SUPPORT_TOPIC_OPTIONS = ["general_help", "ticket_help", "false_update", "account_access"];
 const DEPARTMENT_OPTIONS = [
   "Plumbing Department",
   "Electrical Department",
@@ -37,6 +63,11 @@ const CATEGORY_DEPARTMENT_MAP = {
   Cleanliness: "Sanitation Department",
   Other: "General Facilities Department"
 };
+const DUPLICATE_STOP_WORDS = new Set([
+  "a", "an", "and", "are", "at", "be", "by", "for", "from", "in", "is", "it",
+  "of", "on", "or", "the", "to", "with", "this", "that", "near", "inside",
+  "outside", "building", "block", "hostel", "room", "floor", "issue", "problem"
+]);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -47,6 +78,9 @@ ensureSchema();
 normalizeLegacyData();
 seedDatabase();
 
+let microsoftOpenIdConfigurationCache = null;
+let microsoftJwksCache = null;
+
 function initializeDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -56,6 +90,13 @@ function initializeDatabase() {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'student',
       department TEXT NOT NULL,
+      email_verified INTEGER NOT NULL DEFAULT 1,
+      email_verification_token TEXT,
+      email_verification_sent_at TEXT,
+      password_reset_token TEXT,
+      password_reset_sent_at TEXT,
+      sso_login_token TEXT,
+      sso_login_sent_at TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -115,6 +156,16 @@ function initializeDatabase() {
       FOREIGN KEY (reporter_user_id) REFERENCES users (id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS ticket_supporters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(ticket_id, user_id),
+      FOREIGN KEY (ticket_id) REFERENCES tickets (id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS notifications (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -155,6 +206,15 @@ function ensureSchema() {
   ensureColumn("tickets", "assigned_department", "TEXT");
   ensureColumn("tickets", "assigned_by_user_id", "INTEGER");
   ensureColumn("tickets", "priority", "TEXT");
+  ensureColumn("users", "email_verified", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn("users", "email_verification_token", "TEXT");
+  ensureColumn("users", "email_verification_sent_at", "TEXT");
+  ensureColumn("users", "password_reset_token", "TEXT");
+  ensureColumn("users", "password_reset_sent_at", "TEXT");
+  ensureColumn("users", "sso_login_token", "TEXT");
+  ensureColumn("users", "sso_login_sent_at", "TEXT");
+  ensureColumn("users", "student_id", "TEXT");
+  ensureColumn("users", "faculty_id", "TEXT");
   ensureColumn("users", "phone", "TEXT");
   ensureColumn("users", "alternate_email", "TEXT");
   ensureColumn("users", "campus_address", "TEXT");
@@ -162,6 +222,10 @@ function ensureSchema() {
   ensureColumn("users", "profile_image_data", "TEXT");
   ensureColumn("ticket_updates", "image_data", "TEXT");
   ensureColumn("ticket_reports", "image_data", "TEXT");
+  ensureColumn("support_conversations", "topic", "TEXT");
+  ensureColumn("support_conversations", "linked_ticket_id", "INTEGER");
+  ensureColumn("support_conversations", "unread_for_admin", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("support_conversations", "unread_for_requester", "INTEGER NOT NULL DEFAULT 0");
 }
 
 function ensureColumn(tableName, columnName, columnDefinition) {
@@ -175,6 +239,11 @@ function ensureColumn(tableName, columnName, columnDefinition) {
 function normalizeLegacyData() {
   db.prepare("UPDATE users SET role = 'admin' WHERE role = 'staff'").run();
   db.prepare("UPDATE tickets SET priority = 'medium' WHERE priority IS NULL").run();
+  db.prepare("UPDATE users SET email_verified = 1 WHERE email_verified IS NULL").run();
+  db.prepare("UPDATE support_conversations SET topic = 'general_help' WHERE topic IS NULL").run();
+  db.prepare("UPDATE support_conversations SET unread_for_admin = 0 WHERE unread_for_admin IS NULL").run();
+  db.prepare("UPDATE support_conversations SET unread_for_requester = 0 WHERE unread_for_requester IS NULL").run();
+  db.prepare("UPDATE support_conversations SET status = 'open' WHERE status IS NULL").run();
 
   db.prepare(`
     UPDATE tickets
@@ -385,9 +454,9 @@ function createUser({ fullName, email, password, role, department }) {
   const now = new Date().toISOString();
   const passwordHash = hashPassword(password);
   const result = db.prepare(`
-    INSERT INTO users (full_name, email, password_hash, role, department, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(fullName, email.toLowerCase(), passwordHash, role, department, now);
+    INSERT INTO users (full_name, email, password_hash, role, department, email_verified, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(fullName, email.toLowerCase(), passwordHash, role, department, 1, now);
   return Number(result.lastInsertRowid);
 }
 
@@ -463,8 +532,8 @@ function ensureSupportConversation(requesterUserId) {
 
   const now = new Date().toISOString();
   const result = db.prepare(`
-    INSERT INTO support_conversations (requester_user_id, status, created_at, updated_at)
-    VALUES (?, 'open', ?, ?)
+    INSERT INTO support_conversations (requester_user_id, topic, status, unread_for_admin, unread_for_requester, created_at, updated_at)
+    VALUES (?, 'general_help', 'open', 0, 0, ?, ?)
   `).run(requesterUserId, now, now);
 
   return db.prepare(`
@@ -474,7 +543,7 @@ function ensureSupportConversation(requesterUserId) {
   `).get(Number(result.lastInsertRowid));
 }
 
-function addSupportMessage({ conversationId, senderUserId, message, imageData, createdAt }) {
+function addSupportMessage({ conversationId, senderUserId, senderRole, message, imageData, createdAt }) {
   const result = db.prepare(`
     INSERT INTO support_messages (conversation_id, sender_user_id, message, image_data, created_at)
     VALUES (?, ?, ?, ?, ?)
@@ -482,9 +551,18 @@ function addSupportMessage({ conversationId, senderUserId, message, imageData, c
 
   db.prepare(`
     UPDATE support_conversations
-    SET updated_at = ?, status = 'open'
+    SET updated_at = ?,
+        status = ?,
+        unread_for_admin = ?,
+        unread_for_requester = ?
     WHERE id = ?
-  `).run(createdAt, conversationId);
+  `).run(
+    createdAt,
+    senderRole === "admin" ? "waiting_for_user" : "open",
+    senderRole === "admin" ? 0 : 1,
+    senderRole === "admin" ? 1 : 0,
+    conversationId
+  );
 
   return Number(result.lastInsertRowid);
 }
@@ -511,6 +589,21 @@ function verifyPassword(password, storedHash) {
   return crypto.timingSafeEqual(Buffer.from(originalDigest, "hex"), Buffer.from(candidateDigest, "hex"));
 }
 
+function generateToken() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function isTokenValid(sentAt, ttlMs) {
+  if (!sentAt) {
+    return false;
+  }
+  const timestamp = Date.parse(sentAt);
+  if (Number.isNaN(timestamp)) {
+    return false;
+  }
+  return Date.now() - timestamp <= ttlMs;
+}
+
 function createSession(userId) {
   const sessionId = crypto.randomUUID();
   db.prepare(`
@@ -522,6 +615,10 @@ function createSession(userId) {
 
 function deleteSession(sessionId) {
   db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+}
+
+function deleteSessionsForUser(userId) {
+  db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
 }
 
 function parseCookies(cookieHeader) {
@@ -565,6 +662,9 @@ function getSessionUser(request) {
     email: row.email,
     role: row.role,
     department: row.department,
+    emailVerified: Boolean(row.email_verified),
+    studentId: row.student_id || "",
+    facultyId: row.faculty_id || "",
     phone: row.phone || "",
     alternateEmail: row.alternate_email || "",
     campusAddress: row.campus_address || "",
@@ -581,6 +681,94 @@ function getUserByEmail(email) {
 function getUserById(userId) {
   const row = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
   return row || null;
+}
+
+function getUserByEmailVerificationToken(token) {
+  if (!token) {
+    return null;
+  }
+  return db.prepare("SELECT * FROM users WHERE email_verification_token = ?").get(token) || null;
+}
+
+function getUserByPasswordResetToken(token) {
+  if (!token) {
+    return null;
+  }
+  return db.prepare("SELECT * FROM users WHERE password_reset_token = ?").get(token) || null;
+}
+
+function getUserBySsoLoginToken(token) {
+  if (!token) {
+    return null;
+  }
+  return db.prepare("SELECT * FROM users WHERE sso_login_token = ?").get(token) || null;
+}
+
+function issueEmailVerificationForUser(userId) {
+  const token = generateToken();
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE users
+    SET email_verified = 0,
+        email_verification_token = ?,
+        email_verification_sent_at = ?,
+        sso_login_token = NULL,
+        sso_login_sent_at = NULL
+    WHERE id = ?
+  `).run(token, now, userId);
+  return token;
+}
+
+function verifyUserEmail(userId) {
+  db.prepare(`
+    UPDATE users
+    SET email_verified = 1,
+        email_verification_token = NULL,
+        email_verification_sent_at = NULL
+    WHERE id = ?
+  `).run(userId);
+}
+
+function issuePasswordResetForUser(userId) {
+  const token = generateToken();
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE users
+    SET password_reset_token = ?,
+        password_reset_sent_at = ?
+    WHERE id = ?
+  `).run(token, now, userId);
+  return token;
+}
+
+function clearPasswordResetForUser(userId) {
+  db.prepare(`
+    UPDATE users
+    SET password_reset_token = NULL,
+        password_reset_sent_at = NULL
+    WHERE id = ?
+  `).run(userId);
+}
+
+function issueSsoLoginForUser(userId) {
+  const token = generateToken();
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE users
+    SET sso_login_token = ?,
+        sso_login_sent_at = ?
+    WHERE id = ?
+  `).run(token, now, userId);
+  return token;
+}
+
+function clearSsoLoginForUser(userId) {
+  db.prepare(`
+    UPDATE users
+    SET sso_login_token = NULL,
+        sso_login_sent_at = NULL
+    WHERE id = ?
+  `).run(userId);
 }
 
 function getTicketById(ticketId) {
@@ -624,6 +812,211 @@ function getTicketFeedback(ticketId) {
     JOIN users ON users.id = ticket_feedback.reporter_user_id
     WHERE ticket_feedback.ticket_id = ?
   `).get(ticketId);
+}
+
+function deleteTicketById(ticketId) {
+  db.prepare(`
+    UPDATE support_conversations
+    SET linked_ticket_id = NULL
+    WHERE linked_ticket_id = ?
+  `).run(ticketId);
+
+  const result = db.prepare(`
+    DELETE FROM tickets
+    WHERE id = ?
+  `).run(ticketId);
+
+  return Number(result?.changes || 0) > 0;
+}
+
+function addTicketSupporter(ticketId, userId, createdAt) {
+  const result = db.prepare(`
+    INSERT INTO ticket_supporters (ticket_id, user_id, created_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(ticket_id, user_id) DO NOTHING
+  `).run(ticketId, userId, createdAt);
+  return Number(result?.changes || 0) > 0;
+}
+
+function getActiveTicketForSupport(ticketId) {
+  return db.prepare(`
+    SELECT
+      tickets.id,
+      tickets.code,
+      tickets.title,
+      tickets.category,
+      tickets.location,
+      tickets.status,
+      tickets.owner_user_id,
+      tickets.created_at,
+      tickets.updated_at,
+      (
+        SELECT COUNT(*)
+        FROM ticket_supporters
+        WHERE ticket_supporters.ticket_id = tickets.id
+      ) AS supporter_count
+    FROM tickets
+    WHERE tickets.id = ? AND tickets.status IN ('open', 'in_progress')
+  `).get(ticketId);
+}
+
+function normalizeDuplicateText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeDuplicateText(value) {
+  const normalized = normalizeDuplicateText(value);
+  if (!normalized) {
+    return [];
+  }
+
+  return normalized
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !DUPLICATE_STOP_WORDS.has(token));
+}
+
+function tokenSimilarity(leftTokens, rightTokens) {
+  const leftSet = new Set(leftTokens);
+  const rightSet = new Set(rightTokens);
+  if (leftSet.size === 0 || rightSet.size === 0) {
+    return 0;
+  }
+
+  let intersection = 0;
+  for (const token of leftSet) {
+    if (rightSet.has(token)) {
+      intersection += 1;
+    }
+  }
+
+  const union = leftSet.size + rightSet.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function locationSimilarity(leftLocation, rightLocation) {
+  const leftNormalized = normalizeDuplicateText(leftLocation);
+  const rightNormalized = normalizeDuplicateText(rightLocation);
+  if (!leftNormalized || !rightNormalized) {
+    return 0;
+  }
+
+  if (leftNormalized === rightNormalized) {
+    return 1;
+  }
+
+  if (leftNormalized.includes(rightNormalized) || rightNormalized.includes(leftNormalized)) {
+    return 0.85;
+  }
+
+  return tokenSimilarity(tokenizeDuplicateText(leftNormalized), tokenizeDuplicateText(rightNormalized));
+}
+
+function duplicateReason(match) {
+  if (match.isExact) {
+    return "Exact title and location match in the same category.";
+  }
+  if (match.locationScore >= 0.8 && match.titleScore >= 0.4) {
+    return "Very similar location and title.";
+  }
+  if (match.titleScore >= 0.6) {
+    return "Very similar issue title.";
+  }
+  return "Similar complaint found in active tickets.";
+}
+
+function findPotentialDuplicateTickets(values, limit = 5) {
+  const category = String(values.category || "").trim();
+  const title = String(values.title || "").trim();
+  const location = String(values.location || "").trim();
+  const description = String(values.description || "").trim();
+
+  if (!category || !title || !location) {
+    return [];
+  }
+
+  const titleNormalized = normalizeDuplicateText(title);
+  const locationNormalized = normalizeDuplicateText(location);
+  const titleTokens = tokenizeDuplicateText(title);
+  const descriptionTokens = tokenizeDuplicateText(description);
+
+  const candidates = db.prepare(`
+    SELECT
+      tickets.id,
+      tickets.code,
+      tickets.title,
+      tickets.category,
+      tickets.priority,
+      tickets.location,
+      tickets.description,
+      tickets.status,
+      tickets.owner_user_id,
+      tickets.created_at,
+      tickets.updated_at,
+      (
+        SELECT COUNT(*)
+        FROM ticket_supporters
+        WHERE ticket_supporters.ticket_id = tickets.id
+      ) AS supporter_count
+    FROM tickets
+    WHERE tickets.status IN ('open', 'in_progress')
+    ORDER BY datetime(tickets.updated_at) DESC, tickets.id DESC
+    LIMIT 140
+  `).all();
+
+  const ranked = [];
+  for (const candidate of candidates) {
+    const candidateTitleNormalized = normalizeDuplicateText(candidate.title);
+    const candidateLocationNormalized = normalizeDuplicateText(candidate.location);
+    const sameCategory = candidate.category === category;
+    const isExact = sameCategory && titleNormalized === candidateTitleNormalized && locationNormalized === candidateLocationNormalized;
+
+    const titleScore = tokenSimilarity(titleTokens, tokenizeDuplicateText(candidate.title));
+    const descriptionScore = tokenSimilarity(descriptionTokens, tokenizeDuplicateText(candidate.description || ""));
+    const locationScore = locationSimilarity(location, candidate.location);
+
+    let score = (titleScore * 0.62) + (locationScore * 0.26) + (descriptionScore * 0.12);
+    if (!sameCategory) {
+      score *= 0.62;
+    }
+    if (sameCategory && (titleScore >= 0.45 || locationScore >= 0.72)) {
+      score = Math.min(1, score + 0.06);
+    }
+
+    const isStrong = isExact
+      || score >= 0.64
+      || (sameCategory && titleScore >= 0.5 && locationScore >= 0.45);
+
+    if (!isStrong) {
+      continue;
+    }
+
+    ranked.push({
+      ...candidate,
+      duplicateScore: score,
+      titleScore,
+      descriptionScore,
+      locationScore,
+      isExact,
+      reason: duplicateReason({ isExact, titleScore, locationScore })
+    });
+  }
+
+  ranked.sort((left, right) => {
+    if (left.isExact !== right.isExact) {
+      return left.isExact ? -1 : 1;
+    }
+    if (right.duplicateScore !== left.duplicateScore) {
+      return right.duplicateScore - left.duplicateScore;
+    }
+    return String(right.updated_at || "").localeCompare(String(left.updated_at || ""));
+  });
+
+  return ranked.slice(0, limit);
 }
 
 function getNotificationsForUser(userId, limit = 20) {
@@ -670,9 +1063,12 @@ function getSupportConversationById(conversationId) {
       users.full_name AS requester_name,
       users.email AS requester_email,
       users.department AS requester_department,
-      users.role AS requester_role
+      users.role AS requester_role,
+      tickets.code AS linked_ticket_code,
+      tickets.title AS linked_ticket_title
     FROM support_conversations
     JOIN users ON users.id = support_conversations.requester_user_id
+    LEFT JOIN tickets ON tickets.id = support_conversations.linked_ticket_id
     WHERE support_conversations.id = ?
   `).get(conversationId);
 }
@@ -684,9 +1080,12 @@ function getSupportConversationForUser(userId) {
       users.full_name AS requester_name,
       users.email AS requester_email,
       users.department AS requester_department,
-      users.role AS requester_role
+      users.role AS requester_role,
+      tickets.code AS linked_ticket_code,
+      tickets.title AS linked_ticket_title
     FROM support_conversations
     JOIN users ON users.id = support_conversations.requester_user_id
+    LEFT JOIN tickets ON tickets.id = support_conversations.linked_ticket_id
     WHERE support_conversations.requester_user_id = ?
   `).get(userId);
 }
@@ -699,6 +1098,8 @@ function getSupportConversationsForAdmin() {
       users.email AS requester_email,
       users.department AS requester_department,
       users.role AS requester_role,
+      tickets.code AS linked_ticket_code,
+      tickets.title AS linked_ticket_title,
       (
         SELECT support_messages.message
         FROM support_messages
@@ -712,9 +1113,10 @@ function getSupportConversationsForAdmin() {
         WHERE support_messages.conversation_id = support_conversations.id
         ORDER BY datetime(support_messages.created_at) DESC, support_messages.id DESC
         LIMIT 1
-      ) AS last_image
+    ) AS last_image
     FROM support_conversations
     JOIN users ON users.id = support_conversations.requester_user_id
+    LEFT JOIN tickets ON tickets.id = support_conversations.linked_ticket_id
     ORDER BY datetime(support_conversations.updated_at) DESC, support_conversations.id DESC
   `).all();
 }
@@ -730,6 +1132,70 @@ function getSupportMessages(conversationId) {
     WHERE support_messages.conversation_id = ?
     ORDER BY datetime(support_messages.created_at) ASC, support_messages.id ASC
   `).all(conversationId);
+}
+
+function getAvailableSupportTicketsForUser(userId) {
+  return db.prepare(`
+    SELECT id, code, title, status
+    FROM tickets
+    WHERE owner_user_id = ?
+    ORDER BY datetime(updated_at) DESC, id DESC
+    LIMIT 20
+  `).all(userId);
+}
+
+function updateSupportConversationContext(conversationId, { topic, linkedTicketId, updatedAt }) {
+  db.prepare(`
+    UPDATE support_conversations
+    SET topic = ?,
+        linked_ticket_id = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(topic, linkedTicketId || null, updatedAt, conversationId);
+}
+
+function updateSupportConversationStatus(conversationId, status, updatedAt) {
+  db.prepare(`
+    UPDATE support_conversations
+    SET status = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(status, updatedAt, conversationId);
+}
+
+function markSupportConversationRead(conversationId, viewerRole) {
+  if (viewerRole === "admin") {
+    db.prepare(`
+      UPDATE support_conversations
+      SET unread_for_admin = 0
+      WHERE id = ?
+    `).run(conversationId);
+    return;
+  }
+
+  db.prepare(`
+    UPDATE support_conversations
+    SET unread_for_requester = 0
+    WHERE id = ?
+  `).run(conversationId);
+}
+
+function getUnreadSupportConversationCount(user) {
+  if (user.role === "admin") {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM support_conversations
+      WHERE unread_for_admin > 0
+    `).get();
+    return Number(row?.count || 0);
+  }
+
+  const row = db.prepare(`
+    SELECT unread_for_requester AS count
+    FROM support_conversations
+    WHERE requester_user_id = ?
+  `).get(user.id);
+  return Number(row?.count || 0);
 }
 
 function getTicketStats(user) {
@@ -809,8 +1275,40 @@ function getTickets(user, filters) {
     FROM tickets
     JOIN users ON users.id = tickets.owner_user_id
     ${whereClause}
-    ORDER BY datetime(tickets.updated_at) DESC, tickets.id DESC
+    ORDER BY
+      CASE WHEN tickets.status = 'resolved' THEN 1 ELSE 0 END ASC,
+      datetime(tickets.updated_at) DESC,
+      tickets.id DESC
   `).all(...params);
+}
+
+function getCommunityComplaintFeed(user, limit = 8) {
+  if (!canCreateTicket(user)) {
+    return [];
+  }
+
+  return db.prepare(`
+    SELECT
+      tickets.id,
+      tickets.code,
+      tickets.title,
+      tickets.category,
+      tickets.priority,
+      tickets.location,
+      tickets.status,
+      tickets.owner_user_id,
+      tickets.created_at,
+      tickets.updated_at,
+      (
+        SELECT COUNT(*)
+        FROM ticket_supporters
+        WHERE ticket_supporters.ticket_id = tickets.id
+      ) AS supporter_count
+    FROM tickets
+    WHERE tickets.status IN ('open', 'in_progress')
+    ORDER BY datetime(tickets.updated_at) DESC, tickets.id DESC
+    LIMIT ?
+  `).all(limit);
 }
 
 function userCanAccessTicket(user, ticket) {
@@ -832,6 +1330,253 @@ function parseFilters(searchParams) {
     statuses: searchParams.getAll("status").filter(Boolean),
     priorities: searchParams.getAll("priority").filter(Boolean)
   };
+}
+
+function buildAbsoluteUrl(request, pathname) {
+  const baseUrl = FIXMYCAMPUS_BASE_URL || `http://${request.headers.host || `${HOST}:${PORT}`}`;
+  return `${baseUrl}${pathname}`;
+}
+
+function isMicrosoftSsoConfigured() {
+  return false;
+}
+
+function getUniversitySsoEntryPath() {
+  return "/university-sso";
+}
+
+function getMicrosoftRedirectUri(request) {
+  return MICROSOFT_REDIRECT_URI || buildAbsoluteUrl(request, MICROSOFT_CALLBACK_PATH);
+}
+
+function base64UrlEncode(value) {
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(String(value || ""), "utf8");
+  return buffer.toString("base64url");
+}
+
+function parseBase64UrlJson(value) {
+  return JSON.parse(Buffer.from(String(value || ""), "base64url").toString("utf8"));
+}
+
+function getCookieSignature(value, secret) {
+  return crypto.createHmac("sha256", secret).update(value).digest("base64url");
+}
+
+function createPkceCodeVerifier() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function createPkceCodeChallenge(codeVerifier) {
+  return crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+}
+
+function createMicrosoftOauthState(request) {
+  return {
+    state: crypto.randomBytes(24).toString("base64url"),
+    nonce: crypto.randomBytes(24).toString("base64url"),
+    codeVerifier: createPkceCodeVerifier(),
+    redirectUri: getMicrosoftRedirectUri(request),
+    createdAt: new Date().toISOString()
+  };
+}
+
+function serializeMicrosoftOauthState(data) {
+  const payload = base64UrlEncode(JSON.stringify(data));
+  const signature = getCookieSignature(payload, MICROSOFT_CLIENT_SECRET);
+  return `${payload}.${signature}`;
+}
+
+function readMicrosoftOauthState(serialized) {
+  if (!isMicrosoftSsoConfigured() || !serialized) {
+    return null;
+  }
+
+  const [payload, signature] = String(serialized).split(".");
+  if (!payload || !signature) {
+    return null;
+  }
+
+  const expectedSignature = getCookieSignature(payload, MICROSOFT_CLIENT_SECRET);
+  if (expectedSignature.length !== signature.length) {
+    return null;
+  }
+
+  const isValidSignature = crypto.timingSafeEqual(
+    Buffer.from(expectedSignature, "utf8"),
+    Buffer.from(signature, "utf8")
+  );
+
+  if (!isValidSignature) {
+    return null;
+  }
+
+  try {
+    const data = parseBase64UrlJson(payload);
+    if (!data || typeof data !== "object") {
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function setMicrosoftOauthCookie(serializedState) {
+  return `${MICROSOFT_OAUTH_COOKIE}=${encodeURIComponent(serializedState)}; HttpOnly; Path=/; Max-Age=${Math.floor(MICROSOFT_OAUTH_TTL_MS / 1000)}; SameSite=Lax`;
+}
+
+function clearMicrosoftOauthCookie() {
+  return `${MICROSOFT_OAUTH_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`;
+}
+
+function getMicrosoftAuthorizationUrl(request, stateData) {
+  const url = new URL(`https://login.microsoftonline.com/${MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize`);
+  url.searchParams.set("client_id", MICROSOFT_CLIENT_ID);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", stateData.redirectUri || getMicrosoftRedirectUri(request));
+  url.searchParams.set("response_mode", "query");
+  url.searchParams.set("scope", MICROSOFT_SCOPE);
+  url.searchParams.set("state", stateData.state);
+  url.searchParams.set("nonce", stateData.nonce);
+  url.searchParams.set("code_challenge", createPkceCodeChallenge(stateData.codeVerifier));
+  url.searchParams.set("code_challenge_method", "S256");
+  return url.toString();
+}
+
+async function getMicrosoftOpenIdConfiguration() {
+  if (microsoftOpenIdConfigurationCache) {
+    return microsoftOpenIdConfigurationCache;
+  }
+
+  const response = await fetch(`https://login.microsoftonline.com/${MICROSOFT_TENANT_ID}/v2.0/.well-known/openid-configuration`);
+  if (!response.ok) {
+    throw new Error(`Microsoft discovery request failed with status ${response.status}.`);
+  }
+
+  const configuration = await response.json();
+  microsoftOpenIdConfigurationCache = configuration;
+  return configuration;
+}
+
+async function getMicrosoftJwk(kid) {
+  if (microsoftJwksCache?.has(kid)) {
+    return microsoftJwksCache.get(kid);
+  }
+
+  const metadata = await getMicrosoftOpenIdConfiguration();
+  const response = await fetch(metadata.jwks_uri);
+  if (!response.ok) {
+    throw new Error(`Microsoft signing key request failed with status ${response.status}.`);
+  }
+
+  const jwks = await response.json();
+  microsoftJwksCache = new Map((jwks.keys || []).map((key) => [key.kid, key]));
+  return microsoftJwksCache.get(kid) || null;
+}
+
+function decodeJwt(token) {
+  const [headerPart, payloadPart, signaturePart] = String(token || "").split(".");
+  if (!headerPart || !payloadPart || !signaturePart) {
+    throw new Error("Microsoft returned an invalid identity token.");
+  }
+
+  return {
+    raw: token,
+    signingInput: `${headerPart}.${payloadPart}`,
+    signature: signaturePart,
+    header: parseBase64UrlJson(headerPart),
+    payload: parseBase64UrlJson(payloadPart)
+  };
+}
+
+async function verifyMicrosoftIdToken(idToken, expectedNonce) {
+  const decoded = decodeJwt(idToken);
+  const metadata = await getMicrosoftOpenIdConfiguration();
+  const signingKey = await getMicrosoftJwk(decoded.header.kid);
+
+  if (decoded.header.alg !== "RS256" || !signingKey) {
+    throw new Error("Microsoft returned an identity token with an unsupported signature.");
+  }
+
+  const publicKey = crypto.createPublicKey({
+    key: {
+      kty: signingKey.kty,
+      n: signingKey.n,
+      e: signingKey.e
+    },
+    format: "jwk"
+  });
+
+  const isSignatureValid = crypto.verify(
+    "RSA-SHA256",
+    Buffer.from(decoded.signingInput, "utf8"),
+    publicKey,
+    Buffer.from(decoded.signature, "base64url")
+  );
+
+  if (!isSignatureValid) {
+    throw new Error("Microsoft identity token signature verification failed.");
+  }
+
+  const claims = decoded.payload;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expectedIssuer = String(metadata.issuer || "").replace("{tenantid}", MICROSOFT_TENANT_ID);
+
+  if (claims.aud !== MICROSOFT_CLIENT_ID) {
+    throw new Error("Microsoft identity token audience mismatch.");
+  }
+
+  if (claims.iss !== expectedIssuer) {
+    throw new Error("Microsoft identity token issuer mismatch.");
+  }
+
+  if (String(claims.tid || "") !== MICROSOFT_TENANT_ID) {
+    throw new Error("Microsoft identity token tenant mismatch.");
+  }
+
+  if (!claims.exp || Number(claims.exp) <= nowSeconds) {
+    throw new Error("Microsoft identity token has expired.");
+  }
+
+  if (claims.nbf && Number(claims.nbf) > nowSeconds) {
+    throw new Error("Microsoft identity token is not active yet.");
+  }
+
+  if (expectedNonce && claims.nonce !== expectedNonce) {
+    throw new Error("Microsoft identity token nonce mismatch.");
+  }
+
+  return claims;
+}
+
+async function exchangeMicrosoftAuthorizationCode(code, stateData) {
+  const response = await fetch(`https://login.microsoftonline.com/${MICROSOFT_TENANT_ID}/oauth2/v2.0/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      client_id: MICROSOFT_CLIENT_ID,
+      client_secret: MICROSOFT_CLIENT_SECRET,
+      code,
+      code_verifier: stateData.codeVerifier,
+      grant_type: "authorization_code",
+      redirect_uri: stateData.redirectUri,
+      scope: MICROSOFT_SCOPE
+    })
+  });
+
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const errorMessage = payload?.error_description || payload?.error || `Token request failed with status ${response.status}.`;
+    throw new Error(errorMessage);
+  }
+
+  return payload;
+}
+
+function getMicrosoftIdentityEmail(claims) {
+  return String(claims.preferred_username || claims.email || claims.upn || "").trim().toLowerCase();
 }
 
 function escapeHtml(value) {
@@ -866,6 +1611,32 @@ function roleLabel(role) {
   return "Student";
 }
 
+function supportStatusLabel(status) {
+  if (status === "in_review") {
+    return "In Review";
+  }
+  if (status === "waiting_for_user") {
+    return "Waiting for User";
+  }
+  if (status === "resolved") {
+    return "Resolved";
+  }
+  return "Open";
+}
+
+function supportTopicLabel(topic) {
+  if (topic === "ticket_help") {
+    return "Ticket Help";
+  }
+  if (topic === "false_update") {
+    return "False Update";
+  }
+  if (topic === "account_access") {
+    return "Account Access";
+  }
+  return "General Help";
+}
+
 function canCreateTicket(user) {
   return user.role === "student" || user.role === "faculty";
 }
@@ -884,6 +1655,10 @@ function canReporterEscalate(user, ticket) {
 
 function canReporterManageResolvedTicket(user, ticket) {
   return canReporterEscalate(user, ticket) && ticket.status === "resolved";
+}
+
+function canReporterDeleteTicket(user, ticket) {
+  return canReporterEscalate(user, ticket) && ticket.status === "open";
 }
 
 function hasDepartmentProgress(updates) {
@@ -933,6 +1708,18 @@ function assignmentLabel(ticket) {
   return ticket.assigned_department || "Pending Admin Assignment";
 }
 
+function renderSupportStatusPill(status) {
+  return `<span class="support-status-pill ${escapeHtml(status || "open")}">${escapeHtml(supportStatusLabel(status || "open"))}</span>`;
+}
+
+function renderSupportContextLine(conversation) {
+  const items = [supportTopicLabel(conversation.topic || "general_help"), supportStatusLabel(conversation.status || "open")];
+  if (conversation.linked_ticket_code) {
+    items.push(`Ticket #${conversation.linked_ticket_code}`);
+  }
+  return items.join(" · ");
+}
+
 function reporterDisplayLabel(viewer, reporterUserId, reporterName, reporterRole = "") {
   if (viewer.role === "admin") {
     return reporterRole ? `${reporterName} (${roleLabel(reporterRole)})` : reporterName;
@@ -958,6 +1745,84 @@ function renderReporterIdentityLine(viewer, ticket) {
 
 function suggestedDepartment(category) {
   return CATEGORY_DEPARTMENT_MAP[category] || "General Facilities Department";
+}
+
+function getStudentIdFormatForDepartment(department) {
+  const normalized = String(department || "").trim().toLowerCase();
+
+  if (/\b(llb|law|blb)\b/.test(normalized)) {
+    return {
+      course: "LLB",
+      example: "L24BLBU0000",
+      pattern: /^L\d{2}BLBU\d{4}$/i
+    };
+  }
+
+  if (/\b(bba)\b/.test(normalized)) {
+    return {
+      course: "BBA",
+      example: "M24BBAU0000",
+      pattern: /^M\d{2}BBAU\d{4}$/i
+    };
+  }
+
+  if (/\b(cse|computer science|btech|b\.tech|engineering)\b/.test(normalized)) {
+    return {
+      course: "BTech",
+      example: "S24CSEU0000",
+      pattern: /^S\d{2}CSEU\d{4}$/i
+    };
+  }
+
+  return null;
+}
+
+function parseUniversityEmail(email) {
+  const normalized = String(email || "").trim().toLowerCase();
+  const parts = normalized.split("@");
+  const hasSingleAt = parts.length === 2;
+  const localPart = hasSingleAt ? parts[0] : "";
+  const domainPart = hasSingleAt ? parts[1] : "";
+  const isUniversityDomain = Boolean(localPart && domainPart && domainPart === UNIVERSITY_EMAIL_DOMAIN);
+  const isStudentFormat = /^s\d{2}[a-z]{3,8}\d{4}$/i.test(localPart);
+
+  return {
+    normalized,
+    localPart,
+    domainPart,
+    isUniversityDomain,
+    isStudentFormat
+  };
+}
+
+function validateRoleBasedUniversityEmail(email, role) {
+  const parsed = parseUniversityEmail(email);
+  if (!parsed.isUniversityDomain) {
+    return {
+      ok: false,
+      message: `Use your university email ending with @${UNIVERSITY_EMAIL_DOMAIN}.`
+    };
+  }
+
+  if (role === "student" && !parsed.isStudentFormat) {
+    return {
+      ok: false,
+      message: `Student email must look like s24cseu0458@${UNIVERSITY_EMAIL_DOMAIN}.`
+    };
+  }
+
+  if (role === "faculty" && parsed.isStudentFormat) {
+    return {
+      ok: false,
+      message: "Faculty email cannot use the student roll-number format."
+    };
+  }
+
+  return { ok: true };
+}
+
+function isLegacyDemoEmail(email) {
+  return LEGACY_DEMO_EMAILS.has(String(email || "").trim().toLowerCase());
 }
 
 function priorityLabel(priority) {
@@ -1181,7 +2046,7 @@ function renderAuthPage({ title, heading, subheading, formMarkup }) {
           <div class="footer-links-block">
             <strong>Resources</strong>
             <nav class="footer-links" aria-label="Footer links">
-              <a href="#">About</a>
+             
               <a href="#">Support</a>
               <a href="#">Privacy</a>
               <a href="#">Terms</a>
@@ -1191,6 +2056,15 @@ function renderAuthPage({ title, heading, subheading, formMarkup }) {
       </div>
     `
   );
+}
+
+function renderAuthInfoPage({ title, heading, subheading, bodyMarkup }) {
+  return renderAuthPage({
+    title,
+    heading,
+    subheading,
+    formMarkup: `<section class="login-form auth-info-panel">${bodyMarkup}</section>`
+  });
 }
 
 function renderNotificationBell(user, notifications, unreadCount) {
@@ -1288,6 +2162,7 @@ function renderAppHeader(user, searchValue, notifications, unreadNotificationCou
 }
 
 function renderSidebar(currentNav, filters, user) {
+  const unreadSupportCount = getUnreadSupportConversationCount(user);
   return `
     <aside class="sidebar">
       <nav class="sidebar-nav" aria-label="Sidebar navigation">
@@ -1340,6 +2215,7 @@ function renderSidebar(currentNav, filters, user) {
         <p>Report a problem with the site or get help from Facilities.</p>
         <a href="#">Contact Facilities</a>
         <button class="support-chat-trigger" type="button" data-open-support-drawer>
+          ${unreadSupportCount > 0 ? `<span class="support-chat-badge" data-support-unread-badge="">${escapeHtml(String(Math.min(unreadSupportCount, 99)))}</span>` : ""}
           ${user.role === "admin" ? "Open Admin Support Inbox" : "Contact Admin Support"}
         </button>
       </section>
@@ -1401,12 +2277,69 @@ function renderSupportMessageBubble(message, currentUser) {
   `;
 }
 
+function renderSupportContextEditor(conversation, currentUser) {
+  if (currentUser.role === "admin") {
+    return "";
+  }
+
+  const availableTickets = getAvailableSupportTicketsForUser(currentUser.id);
+  const ticketOptions = availableTickets.length > 0
+    ? `
+      <option value="">No linked ticket</option>
+      ${availableTickets.map((ticket) => `
+        <option value="${ticket.id}" ${Number(conversation.linked_ticket_id) === Number(ticket.id) ? "selected" : ""}>
+          ${escapeHtml(ticket.code)} · ${escapeHtml(truncateText(ticket.title, 42))}
+        </option>
+      `).join("")}
+    `
+    : '<option value="">No linked ticket</option>';
+
+  return `
+    <div class="support-context-grid">
+      <label>
+        <span>Topic</span>
+        <select name="supportTopic">
+          ${SUPPORT_TOPIC_OPTIONS.map((topic) => `
+            <option value="${topic}" ${(conversation.topic || "general_help") === topic ? "selected" : ""}>${escapeHtml(supportTopicLabel(topic))}</option>
+          `).join("")}
+        </select>
+      </label>
+      <label>
+        <span>Linked Ticket</span>
+        <select name="linkedTicketId">
+          ${ticketOptions}
+        </select>
+      </label>
+    </div>
+  `;
+}
+
+function renderSupportAdminControls(conversation, currentPath) {
+  return `
+    <form class="support-status-form" action="/support/conversations/${conversation.id}/status" method="POST">
+      <input type="hidden" name="returnTo" value="${escapeHtml(currentPath)}">
+      <input type="hidden" name="hashTarget" value="#support-chat-${conversation.id}">
+      <label>
+        <span>Status</span>
+        <select name="status">
+          ${SUPPORT_STATUS_OPTIONS.map((status) => `
+            <option value="${status}" ${(conversation.status || "open") === status ? "selected" : ""}>${escapeHtml(supportStatusLabel(status))}</option>
+          `).join("")}
+        </select>
+      </label>
+      <button class="ghost-button compact" type="submit">Update Status</button>
+      ${conversation.linked_ticket_id ? `<a class="text-button" href="/tickets/${conversation.linked_ticket_id}">Open Ticket</a>` : ""}
+    </form>
+  `;
+}
+
 function renderSupportComposer(conversation, currentUser, returnTo, hashTarget, placeholder) {
   return `
     <form class="support-composer" action="/support/messages" method="POST">
       <input type="hidden" name="conversationId" value="${escapeHtml(String(conversation.id))}">
       <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
       <input type="hidden" name="hashTarget" value="${escapeHtml(hashTarget)}">
+      ${renderSupportContextEditor(conversation, currentUser)}
       <div class="support-input-shell">
         <textarea name="message" placeholder="${escapeHtml(placeholder)}"></textarea>
         <div class="support-composer-toolbar">
@@ -1436,7 +2369,7 @@ function renderUserSupportDrawer(user, currentPath) {
 
   return `
     <div class="support-drawer-backdrop" data-support-backdrop></div>
-    <aside class="support-drawer" data-support-drawer>
+    <aside class="support-drawer" data-support-drawer data-support-conversation-id="${escapeHtml(String(fullConversation.id))}">
       <div class="support-drawer-header">
         <div>
           <strong>Admin Support</strong>
@@ -1448,6 +2381,8 @@ function renderUserSupportDrawer(user, currentPath) {
         <div class="support-chat-meta">
           <strong>${escapeHtml(fullConversation.requester_name)}</strong>
           <span>${escapeHtml(roleLabel(user.role))} · ${escapeHtml(user.department)}</span>
+          <span>${escapeHtml(renderSupportContextLine(fullConversation))}</span>
+          ${fullConversation.linked_ticket_id ? `<a class="support-linked-ticket" href="/tickets/${fullConversation.linked_ticket_id}">Open linked ticket #${escapeHtml(fullConversation.linked_ticket_code)}</a>` : ""}
         </div>
         <div class="support-messages">${chatBody}</div>
         ${renderSupportComposer(fullConversation, user, currentPath, "#support-chat", "Write a message to admin support...")}
@@ -1458,12 +2393,15 @@ function renderUserSupportDrawer(user, currentPath) {
 
 function renderAdminSupportDrawer(user, currentPath) {
   const conversations = getSupportConversationsForAdmin();
-  const activeConversation = conversations[0] || null;
   const listMarkup = conversations.length > 0
     ? conversations.map((conversation, index) => `
-        <button class="support-conversation-item ${index === 0 ? "active" : ""}" type="button" data-support-conversation-trigger data-conversation-id="${escapeHtml(String(conversation.id))}">
-          <strong>${escapeHtml(conversation.requester_name)}</strong>
+        <button class="support-conversation-item ${index === 0 ? "active" : ""} ${conversation.unread_for_admin ? "unread" : ""}" type="button" data-support-conversation-trigger data-conversation-id="${escapeHtml(String(conversation.id))}">
+          <div class="support-conversation-topline">
+            <strong>${escapeHtml(conversation.requester_name)}</strong>
+            ${conversation.unread_for_admin ? '<span class="support-unread-dot"></span>' : ""}
+          </div>
           <span>${escapeHtml(conversation.requester_department)} · ${escapeHtml(roleLabel(conversation.requester_role))}</span>
+          <span>${escapeHtml(renderSupportContextLine(conversation))}</span>
           <small>${escapeHtml(truncateText(conversation.last_message || (conversation.last_image ? "Sent an image attachment." : "No messages yet."), 60))}</small>
         </button>
       `).join("")
@@ -1482,8 +2420,15 @@ function renderAdminSupportDrawer(user, currentPath) {
               <div>
                 <strong>${escapeHtml(conversation.requester_name)}</strong>
                 <span>${escapeHtml(conversation.requester_email)} · ${escapeHtml(conversation.requester_department)} · ${escapeHtml(roleLabel(conversation.requester_role))}</span>
+                <span>${escapeHtml(supportTopicLabel(conversation.topic || "general_help"))}</span>
+              </div>
+              <div class="support-meta-actions">
+                ${renderSupportStatusPill(conversation.status || "open")}
+                ${conversation.unread_for_admin ? '<span class="support-meta-unread">Unread</span>' : ""}
               </div>
             </div>
+            ${conversation.linked_ticket_id ? `<div class="support-linked-ticket-row"><a class="support-linked-ticket" href="/tickets/${conversation.linked_ticket_id}">Linked ticket: #${escapeHtml(conversation.linked_ticket_code)} · ${escapeHtml(conversation.linked_ticket_title)}</a></div>` : ""}
+            ${renderSupportAdminControls(conversation, currentPath)}
             <div class="support-messages">${bodyMarkup}</div>
             ${renderSupportComposer(conversation, user, currentPath, `#support-chat-${conversation.id}`, `Reply to ${conversation.requester_name}...`)}
           </section>
@@ -1497,7 +2442,7 @@ function renderAdminSupportDrawer(user, currentPath) {
       <div class="support-drawer-header">
         <div>
           <strong>Admin Support Inbox</strong>
-          <span>${escapeHtml(String(conversations.length))} conversation${conversations.length === 1 ? "" : "s"}</span>
+          <span>${escapeHtml(String(conversations.length))} conversation${conversations.length === 1 ? "" : "s"} · ${escapeHtml(String(conversations.filter((conversation) => Number(conversation.unread_for_admin) > 0).length))} unread</span>
         </div>
         <button class="support-drawer-close" type="button" aria-label="Close admin support inbox" data-close-support-drawer>&times;</button>
       </div>
@@ -1516,12 +2461,14 @@ function renderSupportDrawer(user, currentPath) {
   return renderUserSupportDrawer(user, currentPath);
 }
 
-function renderLoginPage(message = "") {
+function renderLoginPage(message = "", type = "error", values = {}) {
+  const ssoEntryPath = getUniversitySsoEntryPath();
+  const ssoLabel = isMicrosoftSsoConfigured() ? "Continue with Microsoft Entra ID" : "Sign in with University SSO";
   const formMarkup = `
     <form class="login-form" action="/login" method="POST">
-      ${renderFlash(message)}
+      ${renderFlash(message, type)}
       <label for="email">University email</label>
-      <input id="email" name="email" type="email" placeholder="student@fixmycampus.edu" required>
+      <input id="email" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="name@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
       <label for="password">Password</label>
       <input id="password" name="password" type="password" placeholder="Enter your password" required>
       <div class="form-row">
@@ -1531,8 +2478,12 @@ function renderLoginPage(message = "") {
         </label>
         <a href="/signup">Create account</a>
       </div>
+      <div class="form-row">
+        <a href="/forgot-password">Forgot password?</a>
+        <a href="/resend-verification">Resend verification email</a>
+      </div>
       <button class="primary-button" type="submit">Log in</button>
-      <button class="ghost-button" type="button">Sign in with University SSO</button>
+      <a class="ghost-button" href="${ssoEntryPath}">${ssoLabel}</a>
       <div class="demo-box">
         <strong>Demo Accounts</strong>
         <p>Student: <code>student@fixmycampus.edu</code> / <code>password123</code></p>
@@ -1566,7 +2517,8 @@ function renderSignupPage(message = "", values = {}) {
         <option value="faculty" ${values.accountRole === "faculty" ? "selected" : ""}>Faculty</option>
       </select>
       <label for="signupEmail">University email</label>
-      <input id="signupEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="example@university.edu" required>
+      <input id="signupEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="s24cseu0458@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
+      <p class="account-link">Student format: <code>s24cseu0458@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}</code>. Faculty: any non-student address on the same domain.</p>
       <label for="signupPassword">Password</label>
       <input id="signupPassword" name="password" type="password" placeholder="Create a password" required>
       <label for="confirmPassword">Confirm password</label>
@@ -1584,6 +2536,151 @@ function renderSignupPage(message = "", values = {}) {
   });
 }
 
+function renderVerificationSentPage(email, verificationLink) {
+  return renderAuthInfoPage({
+    title: "FixMyCampus | Verify Email",
+    heading: "Verify your email",
+    subheading: "Your account has been created, but email verification is required before sign-in.",
+    bodyMarkup: `
+      <p>We generated a verification link for <strong>${escapeHtml(email)}</strong>.</p>
+      <p>This demo does not send real email yet, so use the link below to complete verification.</p>
+      <div class="demo-box">
+        <strong>Verification Link</strong>
+        <p><a href="${escapeHtml(verificationLink)}">${escapeHtml(verificationLink)}</a></p>
+      </div>
+      <div class="form-actions">
+        <a class="text-button" href="/resend-verification">Resend verification</a>
+        <a class="primary-button compact" href="/">Back to sign in</a>
+      </div>
+    `
+  });
+}
+
+function renderEmailVerifiedPage() {
+  return renderAuthInfoPage({
+    title: "FixMyCampus | Email Verified",
+    heading: "Email verified",
+    subheading: "Your FixMyCampus account is ready to use.",
+    bodyMarkup: `
+      <p>Your email address has been verified successfully. You can sign in now.</p>
+      <div class="form-actions">
+        <a class="primary-button compact" href="/">Go to sign in</a>
+      </div>
+    `
+  });
+}
+
+function renderResendVerificationPage(message = "", type = "error", values = {}) {
+  return renderAuthPage({
+    title: "FixMyCampus | Resend Verification",
+    heading: "Resend verification email",
+    subheading: "Enter your university email and we will generate a fresh verification link.",
+    formMarkup: `
+      <form class="login-form" action="/resend-verification" method="POST">
+        ${renderFlash(message, type)}
+        <label for="resendEmail">University email</label>
+        <input id="resendEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="name@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
+        <button class="primary-button" type="submit">Send verification link</button>
+        <p class="account-link"><a href="/">Back to sign in</a></p>
+      </form>
+    `
+  });
+}
+
+function renderForgotPasswordPage(message = "", type = "error", values = {}) {
+  return renderAuthPage({
+    title: "FixMyCampus | Reset Password",
+    heading: "Forgot your password?",
+    subheading: "Enter your university email and we will generate a reset link.",
+    formMarkup: `
+      <form class="login-form" action="/forgot-password" method="POST">
+        ${renderFlash(message, type)}
+        <label for="forgotEmail">University email</label>
+        <input id="forgotEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="name@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
+        <button class="primary-button" type="submit">Send reset link</button>
+        <p class="account-link"><a href="/">Back to sign in</a></p>
+      </form>
+    `
+  });
+}
+
+function renderUniversitySsoPage(message = "", type = "error", values = {}) {
+  return renderAuthPage({
+    title: "FixMyCampus | University SSO",
+    heading: "University SSO sign-in",
+    subheading: "Enter your university email and we will generate a one-time sign-in link for this demo.",
+    formMarkup: `
+      <form class="login-form" action="/university-sso" method="POST">
+        ${renderFlash(message, type)}
+        <label for="ssoEmail">University email</label>
+        <input id="ssoEmail" name="email" type="email" value="${escapeHtml(values.email || "")}" placeholder="name@${escapeHtml(UNIVERSITY_EMAIL_DOMAIN)}" required>
+        <button class="primary-button" type="submit">Generate sign-in link</button>
+        <p class="account-link"><a href="/">Back to sign in</a></p>
+      </form>
+    `
+  });
+}
+
+function renderUniversitySsoReadyPage(email, signInLink) {
+  return renderAuthInfoPage({
+    title: "FixMyCampus | University SSO",
+    heading: "University SSO link ready",
+    subheading: "Use the link below to finish signing in.",
+    bodyMarkup: `
+      <p>We generated a one-time sign-in link for <strong>${escapeHtml(email)}</strong>.</p>
+      <p>This demo does not connect to a live identity provider yet, so use the link below to complete University SSO.</p>
+      <div class="demo-box">
+        <strong>Sign-in Link</strong>
+        <p><a href="${escapeHtml(signInLink)}">${escapeHtml(signInLink)}</a></p>
+      </div>
+      <div class="form-actions">
+        <a class="text-button" href="/university-sso">Generate another link</a>
+        <a class="primary-button compact" href="/">Back to sign in</a>
+      </div>
+    `
+  });
+}
+
+function renderPasswordResetSentPage(email, resetLink) {
+  return renderAuthInfoPage({
+    title: "FixMyCampus | Password Reset",
+    heading: "Password reset link ready",
+    subheading: "Use the link below to choose a new password.",
+    bodyMarkup: `
+      <p>If an account exists for <strong>${escapeHtml(email)}</strong>, a password reset link has been generated.</p>
+      <p>This demo does not send real email yet, so use the link below.</p>
+      <div class="demo-box">
+        <strong>Reset Link</strong>
+        <p><a href="${escapeHtml(resetLink)}">${escapeHtml(resetLink)}</a></p>
+      </div>
+      <div class="form-actions">
+        <a class="text-button" href="/forgot-password">Send another link</a>
+        <a class="primary-button compact" href="/">Back to sign in</a>
+      </div>
+    `
+  });
+}
+
+function renderResetPasswordPage(token, message = "", type = "error") {
+  return renderAuthPage({
+    title: "FixMyCampus | Choose New Password",
+    heading: "Choose a new password",
+    subheading: "Reset your FixMyCampus password and sign back in.",
+    formMarkup: `
+      <form class="login-form" action="/reset-password" method="POST">
+        ${renderFlash(message, type)}
+        <input type="hidden" name="token" value="${escapeHtml(token)}">
+        <label for="newPassword">New password</label>
+        <input id="newPassword" name="password" type="password" placeholder="Create a strong password" required>
+        <label for="confirmNewPassword">Confirm new password</label>
+        <input id="confirmNewPassword" name="confirmPassword" type="password" placeholder="Confirm your new password" required>
+        <button class="primary-button" type="submit">Update password</button>
+        <p class="account-link"><a href="/">Back to sign in</a></p>
+      </form>
+    `
+  });
+}
+
 function renderStatCard(label, value, iconClass, iconPath) {
   return `
     <article class="stat-card">
@@ -1595,7 +2692,48 @@ function renderStatCard(label, value, iconClass, iconPath) {
   `;
 }
 
-function renderTicketsPage(user, tickets, stats, filters) {
+function renderCampusComplaintFeed(user, tickets, title, subtitle, compact = false, returnTo = "/tickets") {
+  const feedItems = tickets.length > 0
+    ? tickets.map((ticket) => `
+        <article class="complaint-feed-item">
+          <div class="complaint-feed-item-header">
+            <strong>${escapeHtml(ticket.title)}</strong>
+            <span>Ticket #${escapeHtml(ticket.code)}</span>
+          </div>
+          <p>${escapeHtml(ticket.category)} · ${escapeHtml(truncateText(ticket.location, compact ? 46 : 62))}</p>
+          <div class="complaint-feed-item-meta">
+            <span class="complaint-feed-chip priority-${escapeHtml(ticket.priority || "medium")}">${escapeHtml(priorityLabel(ticket.priority || "medium"))}</span>
+            <span class="complaint-feed-chip status-${escapeHtml(ticket.status)}">${escapeHtml(statusLabel(ticket.status))}</span>
+          </div>
+          <small>
+            ${Number(ticket.owner_user_id) === Number(user.id) ? "Reported by you" : "Reported by another campus member"}
+            · ${escapeHtml(formatRelative(ticket.created_at))}
+            · ${escapeHtml(String(Number(ticket.supporter_count || 0) + 1))} affected
+          </small>
+          ${canCreateTicket(user) && Number(ticket.owner_user_id) !== Number(user.id) ? `
+            <div class="complaint-feed-item-actions">
+              <form action="/tickets/${ticket.id}/support" method="POST">
+                <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}">
+                <button class="ghost-button compact" type="submit">I am also affected</button>
+              </form>
+            </div>
+          ` : ""}
+        </article>
+      `).join("")
+    : `<p class="complaint-feed-empty">No active campus complaints right now. If this issue is new, you can create the first ticket.</p>`;
+
+  return `
+    <section class="complaint-feed-card ${compact ? "compact" : ""}">
+      <div class="complaint-feed-header">
+        <h2>${escapeHtml(title)}</h2>
+        <p>${escapeHtml(subtitle)}</p>
+      </div>
+      <div class="complaint-feed-grid">${feedItems}</div>
+    </section>
+  `;
+}
+
+function renderTicketsPage(user, tickets, stats, filters, communityTickets = [], message = "", messageType = "success") {
   const pageTitle = user.role === "admin"
     ? "Admin Ticket Dashboard"
     : user.role === "department"
@@ -1638,6 +2776,16 @@ function renderTicketsPage(user, tickets, stats, filters) {
       `).join("")
     : `<div class="empty-state"><h2>No tickets found</h2><p>Try changing the filters or create a new ticket to get started.</p></div>`;
 
+  const communityFeed = canCreateTicket(user)
+    ? renderCampusComplaintFeed(
+      user,
+      communityTickets,
+      "Campus Complaint Feed",
+      "See active campus complaints before creating another ticket.",
+      false
+    )
+    : "";
+
   return renderAppShell({
     title: "FixMyCampus | My Tickets",
     user,
@@ -1646,6 +2794,8 @@ function renderTicketsPage(user, tickets, stats, filters) {
     searchValue: filters.query,
     currentPath: "/tickets",
     content: `
+      ${!user.emailVerified ? '<section class="page-heading stacked"><div class="flash-banner error">Your primary email is not verified. Check your profile after changing your email to generate and use a new verification link.</div></section>' : ""}
+      ${renderFlash(message, messageType)}
       <section class="stats-grid">
         ${renderStatCard("Total Tickets", stats.total, "pale-blue", '<path d="M8 4h8v2H8V4Zm-2 3h12v13H6V7Zm2 3v2h4v-2H8Zm0 4v2h6v-2H8Z"/>')}
         ${renderStatCard("Open", stats.open, "pale-red", '<path d="M12 3a9 9 0 1 1 0 18 9 9 0 0 1 0-18Zm-1 5v5h2V8h-2Zm0 7v2h2v-2h-2Z"/>')}
@@ -1664,12 +2814,122 @@ function renderTicketsPage(user, tickets, stats, filters) {
         </div>
       </section>
 
+      ${communityFeed}
+
       <section class="ticket-grid">${cards}</section>
     `
   });
 }
 
-function renderCreateTicketPage(user, values = {}, message = "", type = "error") {
+function renderCreateTicketHiddenValues(values, forceCreate = false) {
+  return `
+    <input type="hidden" name="title" value="${escapeHtml(values.title || "")}">
+    <input type="hidden" name="category" value="${escapeHtml(values.category || "")}">
+    <input type="hidden" name="priority" value="${escapeHtml(values.priority || "medium")}">
+    <input type="hidden" name="location" value="${escapeHtml(values.location || "")}">
+    <input type="hidden" name="description" value="${escapeHtml(values.description || "")}">
+    <input type="hidden" name="imageData" value="${escapeHtml(values.imageData || "")}">
+    ${forceCreate ? '<input type="hidden" name="forceCreate" value="1">' : ""}
+  `;
+}
+
+function renderDuplicateMatchPage(user, values, matches, communityTickets, hardBlock = false) {
+  const cards = matches.map((ticket) => `
+    <article class="complaint-feed-item duplicate-match-item">
+      <div class="complaint-feed-item-header">
+        <strong>${escapeHtml(ticket.title)}</strong>
+        <span>Ticket #${escapeHtml(ticket.code)}</span>
+      </div>
+      <p>${escapeHtml(ticket.category)} · ${escapeHtml(ticket.location)}</p>
+      <div class="complaint-feed-item-meta">
+        <span class="complaint-feed-chip priority-${escapeHtml(ticket.priority || "medium")}">${escapeHtml(priorityLabel(ticket.priority || "medium"))}</span>
+        <span class="complaint-feed-chip status-${escapeHtml(ticket.status)}">${escapeHtml(statusLabel(ticket.status))}</span>
+      </div>
+      <small>
+        ${escapeHtml(ticket.reason)}
+        · ${escapeHtml(Math.round(Number(ticket.duplicateScore || 0) * 100))}% similarity
+        · ${escapeHtml(String(Number(ticket.supporter_count || 0) + 1))} affected
+      </small>
+      <div class="complaint-feed-item-actions">
+        ${Number(ticket.owner_user_id) !== Number(user.id) ? `
+          <form action="/tickets/${ticket.id}/support" method="POST">
+            <input type="hidden" name="returnTo" value="/tickets/new?supportAdded=1">
+            <button class="ghost-button compact" type="submit">I am also affected</button>
+          </form>
+        ` : ""}
+        ${Number(ticket.owner_user_id) === Number(user.id) ? `<a class="text-button" href="/tickets/${ticket.id}">Open my ticket</a>` : ""}
+      </div>
+    </article>
+  `).join("");
+
+  const warningMessage = hardBlock
+    ? "An active ticket with the same issue already exists. To reduce duplication, please join an existing complaint."
+    : "Similar active complaints were found. Join one of these tickets to avoid duplicate reporting.";
+
+  const communityFeed = renderCampusComplaintFeed(
+    user,
+    communityTickets,
+    "Other Active Complaints",
+    "These are additional active campus complaints you can review.",
+    true,
+    "/tickets/new?supportAdded=1"
+  );
+
+  return renderAppShell({
+    title: "FixMyCampus | Potential Duplicate Detected",
+    user,
+    currentNav: "create",
+    filters: { query: "", categories: [], statuses: [], priorities: [] },
+    searchValue: "",
+    currentPath: "/tickets/new",
+    content: `
+      <section class="page-heading stacked">
+        <div>
+          <h1>Possible Duplicate Complaints Found</h1>
+          <p>We found active tickets that look similar to your issue.</p>
+        </div>
+      </section>
+
+      <section class="form-card">
+        ${renderFlash(warningMessage, hardBlock ? "error" : "success")}
+        <div class="complaint-feed-grid">${cards}</div>
+      </section>
+
+      ${!hardBlock ? `
+        <section class="form-card">
+          <h2>Create A Separate Ticket</h2>
+          <p class="panel-helper">If your issue is genuinely different, you can still create a separate ticket.</p>
+          <form class="ticket-form" action="/tickets" method="POST">
+            ${renderCreateTicketHiddenValues(values, true)}
+            <div class="form-actions">
+              <a class="text-button" href="/tickets/new">Back and Edit</a>
+              <button class="primary-button compact" type="submit">Create New Ticket Anyway</button>
+            </div>
+          </form>
+        </section>
+      ` : `
+        <section class="form-card">
+          <div class="form-actions">
+            <a class="primary-button compact" href="/tickets/new">Back to Create Ticket</a>
+          </div>
+        </section>
+      `}
+
+      ${communityFeed}
+    `
+  });
+}
+
+function renderCreateTicketPage(user, values = {}, message = "", type = "error", communityTickets = []) {
+  const communityFeed = renderCampusComplaintFeed(
+    user,
+    communityTickets,
+    "Existing Campus Complaints",
+    "Check active complaints first to reduce duplicate tickets.",
+    true,
+    "/tickets/new?supportAdded=1"
+  );
+
   return renderAppShell({
     title: "FixMyCampus | Create New Ticket",
     user,
@@ -1685,18 +2945,20 @@ function renderCreateTicketPage(user, values = {}, message = "", type = "error")
         </div>
       </section>
 
+      ${communityFeed}
+
       <section class="form-card">
         <form class="ticket-form" action="/tickets" method="POST">
           ${renderFlash(message, type)}
           <div class="field-row two-col">
             <label>
               <span>Ticket Title</span>
-              <input name="title" type="text" value="${escapeHtml(values.title || "")}" placeholder="[ Ticket Title here ]" required>
+              <input name="title" type="text" value="${escapeHtml(values.title || "")}" placeholder="Ticket Title here" required>
             </label>
             <label>
               <span>Category</span>
               <select name="category" required>
-                <option value="">[ Select Category ▼ ]</option>
+                <option value="">Select Category ▼</option>
                 ${CATEGORY_OPTIONS.map((category) => `<option value="${category}" ${values.category === category ? "selected" : ""}>${category}</option>`).join("")}
               </select>
             </label>
@@ -1717,7 +2979,7 @@ function renderCreateTicketPage(user, values = {}, message = "", type = "error")
 
           <label>
             <span>Location</span>
-            <input name="location" type="text" value="${escapeHtml(values.location || "")}" placeholder="[ Enter building / hostel / room number ]" required>
+            <input name="location" type="text" value="${escapeHtml(values.location || "")}" placeholder="Enter building / hostel / room number" required>
             <small>Examples: Building B Block, Hostel C2, A Block, P Block, N Block, C1, C6, D2, C9, D4</small>
           </label>
 
@@ -1750,11 +3012,94 @@ function renderCreateTicketPage(user, values = {}, message = "", type = "error")
   });
 }
 
-function renderProfilePage(user, values = {}, message = "", type = "success") {
+function renderProfileImageEditor(user, profileValues) {
+  const hasImage = Boolean(profileValues.profileImageData);
+  return `
+    <div class="profile-avatar-editor ${hasImage ? "has-image" : ""}" data-profile-image-editor>
+      <input
+        id="profileImageInput"
+        type="file"
+        accept="image/*"
+        class="hidden-file-input"
+        data-profile-image-input
+        form="profile-form"
+      >
+      <input
+        type="hidden"
+        name="profileImageData"
+        value="${escapeHtml(profileValues.profileImageData)}"
+        data-profile-image-hidden
+        form="profile-form"
+      >
+      <div class="profile-avatar-shell">
+        <div class="profile-avatar-display ${hasImage ? "has-image" : ""}" data-profile-image-display tabindex="0" aria-label="Profile photo editor">
+          ${hasImage
+            ? `<img src="${profileValues.profileImageData}" alt="${escapeHtml(profileValues.fullName)}" class="profile-avatar-image" data-profile-image-img>`
+            : `<span class="profile-avatar-fallback" data-profile-image-fallback>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm0 2c-4 0-7 2-7 4.5V20h14v-1.5C19 16 16 14 12 14Z"/></svg>
+              </span>`}
+          <button class="profile-avatar-edit-trigger" type="button" data-profile-image-toggle>Edit</button>
+        </div>
+
+        <div class="profile-avatar-actions" data-profile-image-menu>
+          <button class="profile-avatar-action" type="button" data-profile-image-view ${hasImage ? "" : "disabled"}>View</button>
+          <button class="profile-avatar-action" type="button" data-profile-image-change>Change</button>
+          <button class="profile-avatar-action danger" type="button" data-profile-image-remove ${hasImage ? "" : "disabled"}>Remove</button>
+        </div>
+      </div>
+
+      <p class="profile-avatar-hint">Hover the avatar to edit your profile photo.</p>
+
+      <div class="profile-image-modal" data-profile-image-modal>
+        <button class="profile-image-backdrop" type="button" aria-label="Close image preview" data-profile-image-close></button>
+        <div class="profile-image-dialog" role="dialog" aria-modal="true" aria-label="Profile photo preview">
+          <button class="profile-image-close" type="button" aria-label="Close image preview" data-profile-image-close>&times;</button>
+          <img src="${hasImage ? profileValues.profileImageData : ""}" alt="${escapeHtml(profileValues.fullName)}" class="profile-image-modal-img" data-profile-image-modal-img>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderProfileImagePreview(profileValues) {
+  const hasImage = Boolean(profileValues.profileImageData);
+  return `
+    <div class="profile-avatar-editor profile-avatar-static ${hasImage ? "has-image" : ""}">
+      <div class="profile-avatar-shell">
+        <div class="profile-avatar-display ${hasImage ? "has-image" : ""}" aria-label="Profile photo">
+          ${hasImage
+            ? `<img src="${profileValues.profileImageData}" alt="${escapeHtml(profileValues.fullName)}" class="profile-avatar-image">`
+            : `<span class="profile-avatar-fallback">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Zm0 2c-4 0-7 2-7 4.5V20h14v-1.5C19 16 16 14 12 14Z"/></svg>
+              </span>`}
+        </div>
+      </div>
+      <p class="profile-avatar-hint">Use Edit Profile to update your profile photo.</p>
+    </div>
+  `;
+}
+
+function renderProfileDetailItem(label, value, fallback = "Not provided") {
+  const text = String(value || "").trim();
+  return `
+    <article class="profile-detail-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${text ? escapeHtml(text) : `<em>${escapeHtml(fallback)}</em>`}</strong>
+    </article>
+  `;
+}
+
+function renderProfilePage(user, values = {}, message = "", type = "success", options = {}) {
+  const isEditMode = Boolean(options.isEditMode);
+  const studentIdFormat = user.role === "student" ? getStudentIdFormatForDepartment(values.department ?? user.department ?? "") : null;
+  const idLabel = user.role === "faculty" ? "Faculty ID" : "Student ID";
+  const idValue = user.role === "faculty" ? (values.facultyId ?? user.facultyId ?? "") : (values.studentId ?? user.studentId ?? "");
   const profileValues = {
     fullName: values.fullName ?? user.fullName ?? "",
     department: values.department ?? user.department ?? "",
     email: values.email ?? user.email ?? "",
+    studentId: values.studentId ?? user.studentId ?? "",
+    facultyId: values.facultyId ?? user.facultyId ?? "",
     phone: values.phone ?? user.phone ?? "",
     alternateEmail: values.alternateEmail ?? user.alternateEmail ?? "",
     campusAddress: values.campusAddress ?? user.campusAddress ?? "",
@@ -1779,78 +3124,99 @@ function renderProfilePage(user, values = {}, message = "", type = "success") {
 
       <section class="profile-layout">
         <article class="profile-summary-card">
-          <div class="profile-summary-avatar">
-            ${renderUserAvatar({ ...user, profileImageData: profileValues.profileImageData, fullName: profileValues.fullName }, "profile-summary-avatar-inner", "Profile image")}
-          </div>
+          ${isEditMode ? renderProfileImageEditor(user, profileValues) : renderProfileImagePreview(profileValues)}
           <h2>${escapeHtml(profileValues.fullName)}</h2>
           <p>${escapeHtml(roleLabel(user.role))}</p>
           <div class="profile-summary-meta">
             <span>${escapeHtml(profileValues.email)}</span>
             <span>${escapeHtml(profileValues.department)}</span>
+            <span>${user.emailVerified ? "Email verified" : "Email verification pending"}</span>
           </div>
         </article>
 
-        <section class="form-card profile-form-card">
-          <form class="ticket-form profile-form" action="/profile" method="POST">
-            ${renderFlash(message, type)}
-            <div class="field-row two-col">
-              <label>
-                <span>Full Name</span>
-                <input name="fullName" type="text" value="${escapeHtml(profileValues.fullName)}" required>
-              </label>
-              <label>
-                <span>Department / Course</span>
-                <input name="department" type="text" value="${escapeHtml(profileValues.department)}" required>
-              </label>
-            </div>
+        ${isEditMode ? `
+          <section class="form-card profile-form-card">
+            <form id="profile-form" class="ticket-form profile-form profile-edit-form" action="/profile" method="POST">
+              ${renderFlash(message, type)}
+              ${!user.emailVerified ? '<div class="flash-banner error">Your primary email is not verified yet. Updating the email address will require a new verification link.</div>' : ""}
+              <div class="field-row two-col">
+                <label>
+                  <span>Full Name</span>
+                  <input name="fullName" type="text" value="${escapeHtml(profileValues.fullName)}" required>
+                </label>
+                <label>
+                  <span>Department / Course</span>
+                  <input name="department" type="text" value="${escapeHtml(profileValues.department)}" required>
+                </label>
+              </div>
 
-            <div class="field-row two-col">
-              <label>
-                <span>Primary Email</span>
-                <input name="email" type="email" value="${escapeHtml(profileValues.email)}" required>
-              </label>
-              <label>
-                <span>Phone Number</span>
-                <input name="phone" type="text" value="${escapeHtml(profileValues.phone)}" placeholder="+91 98765 43210">
-              </label>
-            </div>
+              <div class="field-row two-col">
+                <label>
+                  <span>Primary Email</span>
+                  <input name="email" type="email" value="${escapeHtml(profileValues.email)}" required>
+                </label>
+                <label>
+                  <span>${idLabel}</span>
+                  <input
+                    name="${user.role === "faculty" ? "facultyId" : "studentId"}"
+                    type="text"
+                    value="${escapeHtml(idValue)}"
+                    placeholder="${user.role === "faculty" ? "FAC-2026-104" : escapeHtml(studentIdFormat?.example || "S24CSEU0000")}"
+                  >
+                </label>
+              </div>
 
-            <div class="field-row two-col">
-              <label>
-                <span>Alternate Email</span>
-                <input name="alternateEmail" type="email" value="${escapeHtml(profileValues.alternateEmail)}" placeholder="alternate@example.com">
-              </label>
+              <div class="field-row two-col">
+                <label>
+                  <span>Alternate Email</span>
+                  <input name="alternateEmail" type="email" value="${escapeHtml(profileValues.alternateEmail)}" placeholder="alternate@example.com">
+                </label>
+                <label>
+                  <span>Phone Number</span>
+                  <input name="phone" type="text" value="${escapeHtml(profileValues.phone)}" placeholder="+91 98765 43210">
+                </label>
+              </div>
+
               <label>
                 <span>Campus Address</span>
                 <input name="campusAddress" type="text" value="${escapeHtml(profileValues.campusAddress)}" placeholder="Hostel / Block / Room / Office">
               </label>
-            </div>
 
-            <label>
-              <span>About You</span>
-              <textarea name="bio" placeholder="Add a short note about yourself or the best way to contact you.">${escapeHtml(profileValues.bio)}</textarea>
-            </label>
+              <label>
+                <span>About You</span>
+                <textarea name="bio" placeholder="Add a short note about yourself or the best way to contact you.">${escapeHtml(profileValues.bio)}</textarea>
+              </label>
 
-            <label class="upload-label">
-              <span>Profile Image</span>
-              <input type="file" accept="image/*" class="hidden-file-input" data-upload-input>
-              <input type="hidden" name="profileImageData" value="${escapeHtml(profileValues.profileImageData)}" data-upload-hidden>
-              <div class="upload-zone profile-upload-zone" data-upload-zone>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 7h-3.2l-1.6-2H9.8L8.2 7H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2Zm-7 9a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-6.2A2.2 2.2 0 1 0 12 14a2.2 2.2 0 0 0 0-4.2Z"/></svg>
-                <strong data-upload-label>Upload Profile Photo</strong>
-                <p>Drag and drop or select an image</p>
-                <div class="upload-preview" data-upload-preview>
-                  ${profileValues.profileImageData ? `<img class="upload-preview-image profile-preview-image" src="${profileValues.profileImageData}" alt="Profile preview">` : ""}
-                </div>
+              <div class="form-actions">
+                <a class="text-button" href="/profile">Cancel</a>
+                <button class="primary-button compact" type="submit">Save Profile</button>
               </div>
-            </label>
-
+            </form>
+          </section>
+        ` : `
+          <section class="form-card profile-form-card profile-readonly-card">
+            ${renderFlash(message, type)}
+            ${!user.emailVerified ? '<div class="flash-banner error">Your primary email is not verified yet. Updating the email address will require a new verification link.</div>' : ""}
+            <div class="profile-readonly-grid">
+              ${renderProfileDetailItem("Full Name", profileValues.fullName)}
+              ${renderProfileDetailItem("Department / Course", profileValues.department)}
+              ${renderProfileDetailItem("Primary Email", profileValues.email)}
+              ${renderProfileDetailItem(idLabel, idValue)}
+              ${renderProfileDetailItem("Alternate Email", profileValues.alternateEmail)}
+              ${renderProfileDetailItem("Phone Number", profileValues.phone)}
+              ${renderProfileDetailItem("Campus Address", profileValues.campusAddress)}
+              ${renderProfileDetailItem("Email Status", user.emailVerified ? "Verified" : "Verification pending")}
+            </div>
+            <div class="profile-bio-card">
+              <span>About You</span>
+              <p>${escapeHtml(profileValues.bio || "No profile note added yet.")}</p>
+            </div>
             <div class="form-actions">
               <a class="text-button" href="/tickets">Back to Tickets</a>
-              <button class="primary-button compact" type="submit">Save Profile</button>
+              <a class="primary-button compact" href="/profile?edit=1">Edit Profile</a>
             </div>
-          </form>
-        </section>
+          </section>
+        `}
       </section>
     `
   });
@@ -2062,6 +3428,28 @@ function renderResolvedTicketSection(user, ticket, feedback, message = "", type 
   `;
 }
 
+function renderDeleteTicketSection(user, ticket) {
+  if (!canReporterDeleteTicket(user, ticket)) {
+    return "";
+  }
+
+  return `
+    <section class="report-section-card">
+      <div class="report-section-header">
+        <div>
+          <h2>Delete Ticket</h2>
+          <p class="panel-helper">This permanently removes the ticket, its timeline updates, escalation reports, and feedback records.</p>
+        </div>
+      </div>
+      <form action="/tickets/${ticket.id}/delete" method="POST" class="report-form" onsubmit="return confirm('Delete this ticket permanently? This action cannot be undone.');">
+        <div class="report-form-actions">
+          <button class="ghost-button compact" type="submit">Delete Ticket</button>
+        </div>
+      </form>
+    </section>
+  `;
+}
+
 function renderTicketDetailPage(user, ticket, updates, reports, feedback, controlMessage = "", controlType = "error", reportMessage = "", reportType = "error", resolvedMessage = "", resolvedType = "success") {
   return renderAppShell({
     title: `FixMyCampus | ${ticket.title}`,
@@ -2119,6 +3507,7 @@ function renderTicketDetailPage(user, ticket, updates, reports, feedback, contro
 
         ${renderReporterEscalationSection(user, ticket, updates, reports, reportMessage, reportType)}
         ${ticket.status === "resolved" ? renderResolvedTicketSection(user, ticket, feedback, resolvedMessage, resolvedType) : ""}
+        ${renderDeleteTicketSection(user, ticket)}
       </div>
     `
   });
@@ -2175,8 +3564,11 @@ function clearSessionCookie() {
   return `${SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`;
 }
 
-function sendHtml(response, html, statusCode = 200) {
-  response.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8" });
+function sendHtml(response, html, statusCode = 200, headers = {}) {
+  response.writeHead(statusCode, {
+    "Content-Type": "text/html; charset=utf-8",
+    ...headers
+  });
   response.end(html);
 }
 
@@ -2203,7 +3595,7 @@ function serveStaticFile(response, filePath) {
 }
 
 async function handleRequest(request, response) {
-  const url = new URL(request.url, `http://${request.headers.host || `${HOST}:${DEFAULT_PORT}`}`);
+  const url = new URL(request.url, `http://${request.headers.host || `${HOST}:${PORT}`}`);
   const pathname = url.pathname;
   const user = getSessionUser(request);
   const cookies = parseCookies(request.headers.cookie);
@@ -2245,10 +3637,30 @@ async function handleRequest(request, response) {
 
   if (request.method === "POST" && pathname === "/login") {
     const form = await parseRequestBody(request);
-    const foundUser = getUserByEmail(form.email);
+    const submittedEmail = String(form.email || "").trim().toLowerCase();
+    const foundUser = getUserByEmail(submittedEmail);
 
     if (!foundUser || !verifyPassword(form.password || "", foundUser.password_hash)) {
-      sendHtml(response, renderLoginPage("Invalid email or password."), 401);
+      sendHtml(response, renderLoginPage("Invalid email or password.", "error", { email: submittedEmail }), 401);
+      return;
+    }
+
+    if (foundUser.role === "student" || foundUser.role === "faculty") {
+      if (!isLegacyDemoEmail(submittedEmail)) {
+        const emailValidation = validateRoleBasedUniversityEmail(submittedEmail, foundUser.role);
+        if (!emailValidation.ok) {
+          sendHtml(response, renderLoginPage(emailValidation.message, "error", { email: submittedEmail }), 403);
+          return;
+        }
+      }
+    }
+
+    if (!foundUser.email_verified) {
+      sendHtml(
+        response,
+        renderLoginPage("Please verify your email before signing in.", "error", { email: submittedEmail }),
+        403
+      );
       return;
     }
 
@@ -2263,6 +3675,78 @@ async function handleRequest(request, response) {
       return;
     }
     sendHtml(response, renderSignupPage());
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/university-sso") {
+    if (user) {
+      redirect(response, "/tickets");
+      return;
+    }
+    sendHtml(response, renderUniversitySsoPage());
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/university-sso") {
+    const form = await parseRequestBody(request);
+    const email = String(form.email || "").trim().toLowerCase();
+
+    if (!email) {
+      sendHtml(response, renderUniversitySsoPage("University email is required.", "error", { email }), 400);
+      return;
+    }
+
+    const parsedEmail = parseUniversityEmail(email);
+    if (!parsedEmail.isUniversityDomain) {
+      sendHtml(
+        response,
+        renderUniversitySsoPage(`Use your university email ending with @${UNIVERSITY_EMAIL_DOMAIN}.`, "error", { email }),
+        400
+      );
+      return;
+    }
+
+    const foundUser = getUserByEmail(email);
+    if (!foundUser) {
+      sendHtml(response, renderUniversitySsoPage("No account exists for that university email. Create an account first.", "error", { email }), 404);
+      return;
+    }
+
+    if (!foundUser.email_verified) {
+      const verificationToken = issueEmailVerificationForUser(foundUser.id);
+      const verificationLink = buildAbsoluteUrl(request, `/verify-email?token=${verificationToken}`);
+      sendHtml(response, renderVerificationSentPage(email, verificationLink), 403);
+      return;
+    }
+
+    const ssoToken = issueSsoLoginForUser(foundUser.id);
+    const signInLink = buildAbsoluteUrl(request, `/university-sso/complete?token=${ssoToken}`);
+    sendHtml(response, renderUniversitySsoReadyPage(email, signInLink));
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/university-sso/complete") {
+    const token = String(url.searchParams.get("token") || "").trim();
+    const foundUser = getUserBySsoLoginToken(token);
+
+    if (!foundUser || !isTokenValid(foundUser.sso_login_sent_at, UNIVERSITY_SSO_TTL_MS)) {
+      sendHtml(response, renderUniversitySsoPage("That university SSO link is invalid or has expired. Request a new sign-in link.", "error"), 400);
+      return;
+    }
+
+    clearSsoLoginForUser(foundUser.id);
+    const sessionId = createSession(foundUser.id);
+    redirect(response, "/tickets", [setSessionCookie(sessionId)]);
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/auth/microsoft/start") {
+    redirect(response, "/university-sso");
+    return;
+  }
+
+  if (request.method === "GET" && pathname === MICROSOFT_CALLBACK_PATH) {
+    redirect(response, "/university-sso");
     return;
   }
 
@@ -2300,6 +3784,12 @@ async function handleRequest(request, response) {
       return;
     }
 
+    const emailValidation = validateRoleBasedUniversityEmail(email, accountRole);
+    if (!emailValidation.ok) {
+      sendHtml(response, renderSignupPage(emailValidation.message, form), 400);
+      return;
+    }
+
     const newUserId = createUser({
       fullName,
       email,
@@ -2307,8 +3797,141 @@ async function handleRequest(request, response) {
       role: accountRole,
       department
     });
-    const sessionId = createSession(newUserId);
-    redirect(response, "/tickets", [setSessionCookie(sessionId)]);
+    const verificationToken = issueEmailVerificationForUser(newUserId);
+    const verificationLink = buildAbsoluteUrl(request, `/verify-email?token=${verificationToken}`);
+    sendHtml(response, renderVerificationSentPage(email, verificationLink), 201);
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/resend-verification") {
+    if (user) {
+      redirect(response, "/tickets");
+      return;
+    }
+    sendHtml(response, renderResendVerificationPage());
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/resend-verification") {
+    const form = await parseRequestBody(request);
+    const email = String(form.email || "").trim().toLowerCase();
+    if (!email) {
+      sendHtml(response, renderResendVerificationPage("University email is required.", "error", { email }), 400);
+      return;
+    }
+
+    const foundUser = getUserByEmail(email);
+    if (!foundUser) {
+      sendHtml(
+        response,
+        renderResendVerificationPage(
+          "If that account exists, you can safely try signing in or submit this form again after checking the address.",
+          "success",
+          { email }
+        ),
+        200
+      );
+      return;
+    }
+
+    if (foundUser.email_verified) {
+      sendHtml(response, renderResendVerificationPage("That email is already verified. You can sign in.", "success", { email }), 200);
+      return;
+    }
+
+    const verificationToken = issueEmailVerificationForUser(foundUser.id);
+    const verificationLink = buildAbsoluteUrl(request, `/verify-email?token=${verificationToken}`);
+    sendHtml(response, renderVerificationSentPage(email, verificationLink));
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/verify-email") {
+    const token = String(url.searchParams.get("token") || "").trim();
+    const foundUser = getUserByEmailVerificationToken(token);
+
+    if (!foundUser || !isTokenValid(foundUser.email_verification_sent_at, EMAIL_VERIFICATION_TTL_MS)) {
+      sendHtml(
+        response,
+        renderResendVerificationPage("That verification link is invalid or has expired. Request a new one.", "error"),
+        400
+      );
+      return;
+    }
+
+    verifyUserEmail(foundUser.id);
+    sendHtml(response, renderEmailVerifiedPage());
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/forgot-password") {
+    if (user) {
+      redirect(response, "/tickets");
+      return;
+    }
+    sendHtml(response, renderForgotPasswordPage());
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/forgot-password") {
+    const form = await parseRequestBody(request);
+    const email = String(form.email || "").trim().toLowerCase();
+    if (!email) {
+      sendHtml(response, renderForgotPasswordPage("University email is required.", "error", { email }), 400);
+      return;
+    }
+
+    const foundUser = getUserByEmail(email);
+    const token = foundUser ? issuePasswordResetForUser(foundUser.id) : generateToken();
+    const resetLink = buildAbsoluteUrl(request, `/reset-password?token=${token}`);
+    sendHtml(response, renderPasswordResetSentPage(email, resetLink));
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/reset-password") {
+    const token = String(url.searchParams.get("token") || "").trim();
+    const foundUser = getUserByPasswordResetToken(token);
+
+    if (!foundUser || !isTokenValid(foundUser.password_reset_sent_at, PASSWORD_RESET_TTL_MS)) {
+      sendHtml(response, renderForgotPasswordPage("That password reset link is invalid or has expired.", "error"), 400);
+      return;
+    }
+
+    sendHtml(response, renderResetPasswordPage(token));
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/reset-password") {
+    const form = await parseRequestBody(request);
+    const token = String(form.token || "").trim();
+    const password = String(form.password || "");
+    const confirmPassword = String(form.confirmPassword || "");
+    const foundUser = getUserByPasswordResetToken(token);
+
+    if (!foundUser || !isTokenValid(foundUser.password_reset_sent_at, PASSWORD_RESET_TTL_MS)) {
+      sendHtml(response, renderForgotPasswordPage("That password reset link is invalid or has expired.", "error"), 400);
+      return;
+    }
+
+    if (password.length < 8) {
+      sendHtml(response, renderResetPasswordPage(token, "Password must be at least 8 characters long.", "error"), 400);
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      sendHtml(response, renderResetPasswordPage(token, "Passwords do not match.", "error"), 400);
+      return;
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET password_hash = ?
+      WHERE id = ?
+    `).run(hashPassword(password), foundUser.id);
+    clearPasswordResetForUser(foundUser.id);
+    clearSsoLoginForUser(foundUser.id);
+    deleteSessionsForUser(foundUser.id);
+
+    sendHtml(response, renderLoginPage("Password updated successfully. You can sign in now.", "success", { email: foundUser.email }));
     return;
   }
 
@@ -2330,7 +3953,18 @@ async function handleRequest(request, response) {
     const filters = parseFilters(url.searchParams);
     const tickets = getTickets(user, filters);
     const stats = getTicketStats(user);
-    sendHtml(response, renderTicketsPage(user, tickets, stats, filters));
+    const communityTickets = canCreateTicket(user) ? getCommunityComplaintFeed(user, 10) : [];
+    const supportAdded = url.searchParams.get("supportAdded") === "1";
+    const deleted = url.searchParams.get("deleted") === "1";
+    const pageMessages = [];
+    if (supportAdded) {
+      pageMessages.push("You have been marked as affected on the existing complaint.");
+    }
+    if (deleted) {
+      pageMessages.push("Your ticket was deleted successfully.");
+    }
+    const pageMessage = pageMessages.join(" ");
+    sendHtml(response, renderTicketsPage(user, tickets, stats, filters, communityTickets, pageMessage, "success"));
     return;
   }
 
@@ -2344,13 +3978,12 @@ async function handleRequest(request, response) {
     const conversationId = Number(form.conversationId || 0);
     const message = String(form.message || "").trim();
     const imageData = String(form.imageData || "").trim();
+    const supportTopic = SUPPORT_TOPIC_OPTIONS.includes(String(form.supportTopic || "").trim())
+      ? String(form.supportTopic || "").trim()
+      : "general_help";
+    const linkedTicketId = Number(form.linkedTicketId || 0);
     const returnTo = String(form.returnTo || "/tickets").startsWith("/") ? String(form.returnTo || "/tickets") : "/tickets";
     const hashTarget = String(form.hashTarget || "#support-chat").startsWith("#") ? String(form.hashTarget || "#support-chat") : "#support-chat";
-
-    if (!message && !imageData) {
-      redirect(response, `${returnTo}${hashTarget}`);
-      return;
-    }
 
     if (imageData && !imageData.startsWith("data:image/")) {
       sendText(response, "Uploaded support image format is invalid.", 400);
@@ -2372,15 +4005,100 @@ async function handleRequest(request, response) {
       return;
     }
 
+    let nextLinkedTicketId = Number(conversation.linked_ticket_id || 0);
+    let contextChanged = false;
+    if (user.role !== "admin") {
+      nextLinkedTicketId = 0;
+      if (linkedTicketId > 0) {
+        const linkedTicket = getTicketById(linkedTicketId);
+        if (!linkedTicket || !userCanAccessTicket(user, linkedTicket)) {
+          sendText(response, "You cannot link that ticket to support.", 403);
+          return;
+        }
+        nextLinkedTicketId = linkedTicketId;
+      }
+
+      if ((conversation.topic || "general_help") !== supportTopic || Number(conversation.linked_ticket_id || 0) !== nextLinkedTicketId) {
+        updateSupportConversationContext(conversationId, {
+          topic: supportTopic,
+          linkedTicketId: nextLinkedTicketId || null,
+          updatedAt: new Date().toISOString()
+        });
+        contextChanged = true;
+      }
+    }
+
+    if (!message && !imageData) {
+      if (contextChanged) {
+        redirect(response, `${returnTo}${hashTarget}`);
+        return;
+      }
+      redirect(response, `${returnTo}${hashTarget}`);
+      return;
+    }
+
     addSupportMessage({
       conversationId,
       senderUserId: user.id,
+      senderRole: user.role,
       message,
       imageData,
       createdAt: new Date().toISOString()
     });
 
     redirect(response, `${returnTo}${hashTarget}`);
+    return;
+  }
+
+  const supportStatusMatch = pathname.match(/^\/support\/conversations\/(\d+)\/status$/);
+  if (request.method === "POST" && supportStatusMatch) {
+    if (user.role !== "admin") {
+      sendText(response, "Only admin can update support conversation status.", 403);
+      return;
+    }
+
+    const conversationId = Number(supportStatusMatch[1]);
+    const conversation = getSupportConversationById(conversationId);
+    if (!conversation) {
+      sendText(response, "Support conversation not found.", 404);
+      return;
+    }
+
+    const form = await parseRequestBody(request);
+    const status = String(form.status || "").trim();
+    const returnTo = String(form.returnTo || "/tickets").startsWith("/") ? String(form.returnTo || "/tickets") : "/tickets";
+    const hashTarget = String(form.hashTarget || `#support-chat-${conversationId}`).startsWith("#") ? String(form.hashTarget || `#support-chat-${conversationId}`) : `#support-chat-${conversationId}`;
+
+    if (!SUPPORT_STATUS_OPTIONS.includes(status)) {
+      sendText(response, "Support status is invalid.", 400);
+      return;
+    }
+
+    updateSupportConversationStatus(conversationId, status, new Date().toISOString());
+    redirect(response, `${returnTo}${hashTarget}`);
+    return;
+  }
+
+  const supportReadMatch = pathname.match(/^\/support\/conversations\/(\d+)\/read$/);
+  if (request.method === "POST" && supportReadMatch) {
+    const conversationId = Number(supportReadMatch[1]);
+    const conversation = getSupportConversationById(conversationId);
+    if (!conversation) {
+      sendText(response, JSON.stringify({ ok: false }), 404, "application/json; charset=utf-8");
+      return;
+    }
+
+    const canAccessConversation = user.role === "admin"
+      ? true
+      : Number(conversation.requester_user_id) === Number(user.id);
+
+    if (!canAccessConversation) {
+      sendText(response, JSON.stringify({ ok: false }), 403, "application/json; charset=utf-8");
+      return;
+    }
+
+    markSupportConversationRead(conversationId, user.role);
+    sendText(response, JSON.stringify({ ok: true }), 200, "application/json; charset=utf-8");
     return;
   }
 
@@ -2399,18 +4117,23 @@ async function handleRequest(request, response) {
   }
 
   if (request.method === "GET" && pathname === "/profile") {
+    const isEditMode = url.searchParams.get("edit") === "1";
     const currentUser = getUserById(user.id);
     const profileUser = {
       ...user,
       fullName: currentUser?.full_name || user.fullName,
       email: currentUser?.email || user.email,
       department: currentUser?.department || user.department,
+      emailVerified: Boolean(currentUser?.email_verified),
+      studentId: currentUser?.student_id || "",
+      facultyId: currentUser?.faculty_id || "",
       phone: currentUser?.phone || "",
       alternateEmail: currentUser?.alternate_email || "",
       campusAddress: currentUser?.campus_address || "",
-      bio: currentUser?.bio || ""
+      bio: currentUser?.bio || "",
+      profileImageData: currentUser?.profile_image_data || user.profileImageData || ""
     };
-    sendHtml(response, renderProfilePage(profileUser));
+    sendHtml(response, renderProfilePage(profileUser, {}, "", "success", { isEditMode }));
     return;
   }
 
@@ -2420,6 +4143,8 @@ async function handleRequest(request, response) {
       fullName: String(form.fullName || "").trim(),
       department: String(form.department || "").trim(),
       email: String(form.email || "").trim().toLowerCase(),
+      studentId: String(form.studentId || "").trim(),
+      facultyId: String(form.facultyId || "").trim(),
       phone: String(form.phone || "").trim(),
       alternateEmail: String(form.alternateEmail || "").trim(),
       campusAddress: String(form.campusAddress || "").trim(),
@@ -2433,50 +4158,101 @@ async function handleRequest(request, response) {
     };
 
     if (!values.fullName || !values.department || !values.email) {
-      sendHtml(response, renderProfilePage(profileUser, values, "Full name, department, and primary email are required.", "error"), 400);
+      sendHtml(response, renderProfilePage(profileUser, values, "Full name, department, and primary email are required.", "error", { isEditMode: true }), 400);
       return;
     }
 
     const emailOwner = getUserByEmail(values.email);
     if (emailOwner && Number(emailOwner.id) !== Number(user.id)) {
-      sendHtml(response, renderProfilePage(profileUser, values, "That primary email is already used by another account.", "error"), 409);
+      sendHtml(response, renderProfilePage(profileUser, values, "That primary email is already used by another account.", "error", { isEditMode: true }), 409);
       return;
     }
 
     if (values.alternateEmail) {
       const altEmailOwner = getUserByEmail(values.alternateEmail);
       if (altEmailOwner && Number(altEmailOwner.id) !== Number(user.id)) {
-        sendHtml(response, renderProfilePage(profileUser, values, "That alternate email is already used by another account.", "error"), 409);
+        sendHtml(response, renderProfilePage(profileUser, values, "That alternate email is already used by another account.", "error", { isEditMode: true }), 409);
         return;
       }
     }
 
     if (values.profileImageData && !values.profileImageData.startsWith("data:image/")) {
-      sendHtml(response, renderProfilePage(profileUser, values, "Uploaded profile image format is invalid.", "error"), 400);
+      sendHtml(response, renderProfilePage(profileUser, values, "Uploaded profile image format is invalid.", "error", { isEditMode: true }), 400);
       return;
     }
 
+    if (user.role === "student" && values.studentId) {
+      const studentIdFormat = getStudentIdFormatForDepartment(values.department);
+      if (studentIdFormat && !studentIdFormat.pattern.test(values.studentId)) {
+        sendHtml(
+          response,
+          renderProfilePage(
+            profileUser,
+            values,
+            `Student ID format is invalid for ${studentIdFormat.course}. Use a value like ${studentIdFormat.example}.`,
+            "error",
+            { isEditMode: true }
+          ),
+          400
+        );
+        return;
+      }
+    }
+
+    const currentUser = getUserById(user.id);
+    const emailChanged = String(currentUser?.email || "").toLowerCase() !== values.email;
+    let profileMessage = "Profile updated successfully.";
+    let profileMessageType = "success";
+    let nextEmailVerified = Boolean(currentUser?.email_verified);
+
     db.prepare(`
       UPDATE users
-      SET full_name = ?, email = ?, department = ?, phone = ?, alternate_email = ?, campus_address = ?, bio = ?, profile_image_data = ?
+      SET full_name = ?, email = ?, department = ?, student_id = ?, faculty_id = ?, phone = ?, alternate_email = ?, campus_address = ?, bio = ?, profile_image_data = ?,
+          email_verified = CASE WHEN ? THEN 0 ELSE email_verified END,
+          email_verification_token = CASE WHEN ? THEN NULL ELSE email_verification_token END,
+          email_verification_sent_at = CASE WHEN ? THEN NULL ELSE email_verification_sent_at END
       WHERE id = ?
     `).run(
       values.fullName,
       values.email,
       values.department,
+      values.studentId || null,
+      values.facultyId || null,
       values.phone || null,
       values.alternateEmail || null,
       values.campusAddress || null,
       values.bio || null,
       values.profileImageData || null,
+      emailChanged ? 1 : 0,
+      emailChanged ? 1 : 0,
+      emailChanged ? 1 : 0,
       user.id
     );
+
+    if (emailChanged) {
+      const verificationToken = issueEmailVerificationForUser(user.id);
+      const verificationLink = buildAbsoluteUrl(request, `/verify-email?token=${verificationToken}`);
+      profileMessage = `Primary email changed. Verify it here: ${verificationLink}`;
+      profileMessageType = "error";
+      nextEmailVerified = false;
+      deleteSessionsForUser(user.id);
+      const sessionId = cookies[SESSION_COOKIE];
+      if (sessionId) {
+        db.prepare(`
+          INSERT INTO sessions (id, user_id, created_at)
+          VALUES (?, ?, ?)
+        `).run(sessionId, user.id, new Date().toISOString());
+      }
+    }
 
     const updatedUser = {
       ...user,
       fullName: values.fullName,
       email: values.email,
       department: values.department,
+      emailVerified: nextEmailVerified,
+      studentId: values.studentId,
+      facultyId: values.facultyId,
       phone: values.phone,
       alternateEmail: values.alternateEmail,
       campusAddress: values.campusAddress,
@@ -2484,7 +4260,7 @@ async function handleRequest(request, response) {
       profileImageData: values.profileImageData
     };
 
-    sendHtml(response, renderProfilePage(updatedUser, {}, "Profile updated successfully.", "success"));
+    sendHtml(response, renderProfilePage(updatedUser, {}, profileMessage, profileMessageType, { isEditMode: false }));
     return;
   }
 
@@ -2493,7 +4269,11 @@ async function handleRequest(request, response) {
       sendText(response, "Only student and faculty accounts can create tickets.", 403);
       return;
     }
-    sendHtml(response, renderCreateTicketPage(user));
+    const communityTickets = getCommunityComplaintFeed(user, 8);
+    const supportAdded = url.searchParams.get("supportAdded") === "1";
+    const pageMessage = supportAdded ? "You have been added as affected on an existing complaint." : "";
+    const pageMessageType = supportAdded ? "success" : "error";
+    sendHtml(response, renderCreateTicketPage(user, {}, pageMessage, pageMessageType, communityTickets));
     return;
   }
 
@@ -2512,24 +4292,38 @@ async function handleRequest(request, response) {
       description: String(form.description || "").trim(),
       imageData: String(form.imageData || "").trim()
     };
+    const forceCreate = String(form.forceCreate || "").trim() === "1";
+    const communityTickets = getCommunityComplaintFeed(user, 8);
 
     if (!values.title || !values.category || !values.location || !values.description) {
-      sendHtml(response, renderCreateTicketPage(user, values, "Title, category, location, and description are required."), 400);
+      sendHtml(response, renderCreateTicketPage(user, values, "Title, category, location, and description are required.", "error", communityTickets), 400);
       return;
     }
 
     if (!CATEGORY_OPTIONS.includes(values.category)) {
-      sendHtml(response, renderCreateTicketPage(user, values, "Please select a valid category."), 400);
+      sendHtml(response, renderCreateTicketPage(user, values, "Please select a valid category.", "error", communityTickets), 400);
       return;
     }
 
     if (!PRIORITY_OPTIONS.includes(values.priority)) {
-      sendHtml(response, renderCreateTicketPage(user, values, "Please select a valid priority."), 400);
+      sendHtml(response, renderCreateTicketPage(user, values, "Please select a valid priority.", "error", communityTickets), 400);
       return;
     }
 
     if (values.imageData && !values.imageData.startsWith("data:image/")) {
-      sendHtml(response, renderCreateTicketPage(user, values, "Uploaded image format is invalid."), 400);
+      sendHtml(response, renderCreateTicketPage(user, values, "Uploaded image format is invalid.", "error", communityTickets), 400);
+      return;
+    }
+
+    const duplicateMatches = findPotentialDuplicateTickets(values, 5);
+    const hasExactDuplicate = duplicateMatches.some((match) => match.isExact);
+    if (hasExactDuplicate) {
+      sendHtml(response, renderDuplicateMatchPage(user, values, duplicateMatches, communityTickets, true), 409);
+      return;
+    }
+
+    if (duplicateMatches.length > 0 && !forceCreate) {
+      sendHtml(response, renderDuplicateMatchPage(user, values, duplicateMatches, communityTickets, false), 409);
       return;
     }
 
@@ -2558,6 +4352,33 @@ async function handleRequest(request, response) {
     });
 
     redirect(response, `/tickets/${ticketId}`);
+    return;
+  }
+
+  const supportMatch = pathname.match(/^\/tickets\/(\d+)\/support$/);
+  if (request.method === "POST" && supportMatch) {
+    if (!canCreateTicket(user)) {
+      sendText(response, "Only student and faculty accounts can support tickets.", 403);
+      return;
+    }
+
+    const ticketId = Number(supportMatch[1]);
+    const ticket = getActiveTicketForSupport(ticketId);
+    if (!ticket) {
+      sendText(response, "That complaint is not available for support.", 404);
+      return;
+    }
+
+    const form = await parseRequestBody(request);
+    const requestedReturnTo = String(form.returnTo || "/tickets/new").trim();
+    const safeReturnTo = requestedReturnTo.startsWith("/") ? requestedReturnTo : "/tickets/new";
+    const alreadyHasSupportParam = /(?:\?|&)supportAdded=1(?:&|$)/.test(safeReturnTo);
+    const redirectTarget = alreadyHasSupportParam
+      ? safeReturnTo
+      : `${safeReturnTo}${safeReturnTo.includes("?") ? "&" : "?"}supportAdded=1`;
+
+    addTicketSupporter(ticketId, user.id, new Date().toISOString());
+    redirect(response, redirectTarget);
     return;
   }
 
@@ -2816,10 +4637,34 @@ async function handleRequest(request, response) {
     return;
   }
 
+  const deleteMatch = pathname.match(/^\/tickets\/(\d+)\/delete$/);
+  if (request.method === "POST" && deleteMatch) {
+    const ticketId = Number(deleteMatch[1]);
+    const ticket = getTicketById(ticketId);
+    if (!ticket || !userCanAccessTicket(user, ticket)) {
+      sendText(response, "Ticket not found", 404);
+      return;
+    }
+
+    if (!canReporterDeleteTicket(user, ticket)) {
+      sendText(response, "Only the original reporter can delete this ticket.", 403);
+      return;
+    }
+
+    const deleted = deleteTicketById(ticketId);
+    if (!deleted) {
+      sendText(response, "Ticket not found", 404);
+      return;
+    }
+
+    redirect(response, "/tickets?deleted=1");
+    return;
+  }
+
   sendText(response, "Not found", 404);
 }
 
-function startServer(port = DEFAULT_PORT) {
+function startServer(port = PORT) {
   return new Promise((resolve) => {
     const server = http.createServer((request, response) => {
       handleRequest(request, response).catch((error) => {

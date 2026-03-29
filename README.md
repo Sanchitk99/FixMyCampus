@@ -15,6 +15,8 @@ The current version is a working Node.js application with SQLite persistence, ro
 - False-update escalation from reporter to admin
 - Priority-based ticketing and filtering
 - Resolved-ticket feedback and reopen requests
+- Email verification for new accounts
+- Password reset flow
 
 ## Workflow
 
@@ -54,6 +56,9 @@ The current version is a working Node.js application with SQLite persistence, ro
 ## Implemented Features
 
 - Authentication with cookie-based sessions
+- Email verification required for newly created reporter accounts
+- University SSO with Microsoft Entra ID support and demo one-time link fallback
+- Password reset flow with secure reset tokens
 - Signup for reporter accounts (`student` and `faculty`)
 - Seeded accounts for admin and department users
 - SQLite-backed persistence
@@ -79,6 +84,7 @@ The current version is a working Node.js application with SQLite persistence, ro
   - name
   - department / course
   - phone number
+  - student ID / faculty ID
   - alternate email
   - campus address
   - personal bio / contact note
@@ -166,6 +172,31 @@ The app runs at:
 http://127.0.0.1:3000
 ```
 
+### Optional Microsoft Entra SSO
+
+To enable live university SSO instead of the demo one-time link flow, set these environment variables before starting the app:
+
+```text
+MICROSOFT_CLIENT_ID=your-app-client-id
+MICROSOFT_TENANT_ID=your-directory-tenant-id
+MICROSOFT_CLIENT_SECRET=your-client-secret-value
+```
+
+Optional:
+
+```text
+FIXMYCAMPUS_BASE_URL=http://localhost:3000
+MICROSOFT_REDIRECT_URI=http://localhost:3000/auth/microsoft/callback
+```
+
+In Microsoft Entra, add this redirect URI to the app registration:
+
+```text
+http://localhost:3000/auth/microsoft/callback
+```
+
+If the Microsoft variables are not present, the app falls back to the demo SSO link flow.
+
 ## Verification
 
 Run the end-to-end smoke test:
@@ -191,6 +222,8 @@ The smoke test covers:
 - The application uses `node:sqlite`, which currently shows an experimental warning in Node.js.
 - The database is created automatically inside `data/`.
 - Reporter signup is limited to `student` and `faculty` roles by design.
+- In this demo build, verification and password reset links are rendered on-screen instead of being sent through a real email provider.
+- University SSO uses Microsoft Entra ID when configured, and falls back to one-time sign-in links otherwise.
 
 ## Future Enhancements
 

@@ -15,7 +15,145 @@ const { startServer } = require("./server");
 
   try {
     let response = await fetch(`${base}/`);
-    console.log("root", response.status);
+    const rootHtml = await response.text();
+    console.log(
+      "root",
+      response.status,
+      rootHtml.includes('href="/university-sso"') || rootHtml.includes('href="/auth/microsoft/start"')
+    );
+
+    response = await fetch(`${base}/signup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        fullName: "Aarav Sharma",
+        department: "Computer Science",
+        accountRole: "student",
+        email: "aarav@fixmycampus.edu",
+        password: "resetpass123",
+        confirmPassword: "resetpass123"
+      })
+    });
+    const signupHtml = await response.text();
+    const verificationLinkMatch = signupHtml.match(/href="(http:\/\/127\.0\.0\.1:\d+\/verify-email\?token=[^"]+)"/);
+    console.log("signup-verification", response.status, signupHtml.includes("Verify your email"), Boolean(verificationLinkMatch));
+
+    if (!verificationLinkMatch) {
+      throw new Error("Expected verification link after signup.");
+    }
+
+    response = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        email: "aarav@fixmycampus.edu",
+        password: "resetpass123"
+      })
+    });
+    const blockedLoginHtml = await response.text();
+    console.log("unverified-login-blocked", response.status, blockedLoginHtml.includes("Please verify your email before signing in."));
+
+    response = await fetch(verificationLinkMatch[1]);
+    const verifiedHtml = await response.text();
+    console.log("email-verified", response.status, verifiedHtml.includes("Email verified"));
+
+    response = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        email: "aarav@fixmycampus.edu",
+        password: "resetpass123"
+      }),
+      redirect: "manual"
+    });
+    const verifiedUserCookie = (response.headers.get("set-cookie") || "").split(";")[0];
+    console.log("verified-login", response.status, response.headers.get("location"), Boolean(verifiedUserCookie));
+
+    response = await fetch(`${base}/university-sso`);
+    const ssoPageHtml = await response.text();
+    const usesMicrosoftSso = ssoPageHtml.includes("/auth/microsoft/start") || ssoPageHtml.includes("Microsoft Entra ID");
+    console.log("sso-page", response.status, usesMicrosoftSso ? "microsoft" : "demo");
+
+    if (!usesMicrosoftSso) {
+      response = await fetch(`${base}/university-sso`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          email: "aarav@fixmycampus.edu"
+        })
+      });
+      const ssoReadyHtml = await response.text();
+      const ssoLinkMatch = ssoReadyHtml.match(/href="(http:\/\/127\.0\.0\.1:\d+\/university-sso\/complete\?token=[^"]+)"/);
+      console.log("sso-link", response.status, ssoReadyHtml.includes("University SSO link ready"), Boolean(ssoLinkMatch));
+
+      if (!ssoLinkMatch) {
+        throw new Error("Expected university SSO link after SSO sign-in flow.");
+      }
+
+      response = await fetch(ssoLinkMatch[1], { redirect: "manual" });
+      const ssoCookie = (response.headers.get("set-cookie") || "").split(";")[0];
+      console.log("sso-login", response.status, response.headers.get("location"), Boolean(ssoCookie));
+    } else {
+      console.log("sso-login", "skipped", "external-provider");
+    }
+
+    response = await fetch(`${base}/forgot-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        email: "aarav@fixmycampus.edu"
+      })
+    });
+    const forgotPasswordHtml = await response.text();
+    const resetLinkMatch = forgotPasswordHtml.match(/href="(http:\/\/127\.0\.0\.1:\d+\/reset-password\?token=[^"]+)"/);
+    console.log("password-reset-link", response.status, forgotPasswordHtml.includes("Password reset link ready"), Boolean(resetLinkMatch));
+
+    if (!resetLinkMatch) {
+      throw new Error("Expected password reset link after forgot-password flow.");
+    }
+
+    response = await fetch(resetLinkMatch[1]);
+    const resetFormHtml = await response.text();
+    const resetTokenMatch = resetFormHtml.match(/name="token" value="([^"]+)"/);
+    console.log("password-reset-form", response.status, resetFormHtml.includes("Choose a new password"), Boolean(resetTokenMatch));
+
+    if (!resetTokenMatch) {
+      throw new Error("Expected password reset token in reset form.");
+    }
+
+    response = await fetch(`${base}/reset-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        token: resetTokenMatch[1],
+        password: "updatedpass123",
+        confirmPassword: "updatedpass123"
+      })
+    });
+    const resetDoneHtml = await response.text();
+    console.log("password-reset-complete", response.status, resetDoneHtml.includes("Password updated successfully."));
+
+    response = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        email: "aarav@fixmycampus.edu",
+        password: "resetpass123"
+      })
+    });
+    const oldPasswordHtml = await response.text();
+    console.log("old-password-rejected", response.status, oldPasswordHtml.includes("Invalid email or password."));
+
+    response = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        email: "aarav@fixmycampus.edu",
+        password: "updatedpass123"
+      }),
+      redirect: "manual"
+    });
+    console.log("new-password-login", response.status, response.headers.get("location"), Boolean((response.headers.get("set-cookie") || "").split(";")[0]));
 
     response = await fetch(`${base}/login`, {
       method: "POST",
@@ -37,6 +175,7 @@ const { startServer } = require("./server");
     console.log("tickets", response.status, ticketsHtml.includes("My Tickets"), ticketsHtml.includes("Leaking vents in BLA-210"));
 
     const supportConversationMatch = ticketsHtml.match(/name="conversationId" value="(\d+)"/);
+    const linkedTicketMatch = ticketsHtml.match(/href="\/tickets\/(\d+)"/);
     console.log("support-drawer", response.status, ticketsHtml.includes("Contact Admin Support"), Boolean(supportConversationMatch));
 
     if (!supportConversationMatch) {
@@ -44,6 +183,7 @@ const { startServer } = require("./server");
     }
 
     const supportConversationId = supportConversationMatch[1];
+    const linkedTicketId = linkedTicketMatch ? linkedTicketMatch[1] : "";
 
     response = await fetch(`${base}/support/messages`, {
       method: "POST",
@@ -55,6 +195,8 @@ const { startServer } = require("./server");
         conversationId: supportConversationId,
         returnTo: "/tickets",
         hashTarget: "#support-chat",
+        supportTopic: "ticket_help",
+        linkedTicketId,
         message: "I need direct help from admin support regarding this campus issue.",
         imageData: sampleReportImage
       }),
@@ -72,6 +214,7 @@ const { startServer } = require("./server");
         fullName: "Shashwat Gupta",
         department: "Computer Science",
         email: "student@fixmycampus.edu",
+        studentId: "S24CSEU0204",
         phone: "+91 9876543210",
         alternateEmail: "student.alt@fixmycampus.edu",
         campusAddress: "Hostel B, Room 204",
@@ -84,6 +227,7 @@ const { startServer } = require("./server");
       "profile-update",
       response.status,
       profileHtml.includes("Profile updated successfully."),
+      profileHtml.includes("S24CSEU0204"),
       profileHtml.includes("Hostel B, Room 204"),
       profileHtml.includes("Student volunteer and hostel resident."),
       profileHtml.includes(sampleProfileImage)
@@ -160,6 +304,7 @@ const { startServer } = require("./server");
       "admin-support-inbox",
       response.status,
       adminTicketsHtml.includes("Open Admin Support Inbox"),
+      adminTicketsHtml.includes("Ticket Help"),
       adminTicketsHtml.includes("I need direct help from admin support regarding this campus issue."),
       adminTicketsHtml.includes("Shashwat Gupta")
     );
@@ -180,6 +325,21 @@ const { startServer } = require("./server");
       redirect: "manual"
     });
     console.log("admin-support-reply", response.status, response.headers.get("location"));
+
+    response = await fetch(`${base}/support/conversations/${supportConversationId}/status`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        cookie: adminCookie
+      },
+      body: new URLSearchParams({
+        status: "in_review",
+        returnTo: "/tickets",
+        hashTarget: `#support-chat-${supportConversationId}`
+      }),
+      redirect: "manual"
+    });
+    console.log("admin-support-status", response.status, response.headers.get("location"));
 
     response = await fetch(`${base}/tickets`, {
       method: "POST",
@@ -260,7 +420,11 @@ const { startServer } = require("./server");
       ticketsWithNotificationHtml.includes('href="/notifications"'),
       ticketsWithNotificationHtml.includes('class="badge">1<')
     );
-    console.log("support-reply-visible", ticketsWithNotificationHtml.includes("Admin support is reviewing your concern now."));
+    console.log(
+      "support-reply-visible",
+      ticketsWithNotificationHtml.includes("Admin support is reviewing your concern now."),
+      ticketsWithNotificationHtml.includes("In Review")
+    );
 
     response = await fetch(`${base}/notifications`, {
       headers: { cookie: studentCookie }
