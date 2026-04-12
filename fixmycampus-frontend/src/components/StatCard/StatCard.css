@@ -1,0 +1,61 @@
+.ui-stat-card {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  background: #fff;
+  border-radius: 12px;
+  padding: 1.15rem 1.25rem;
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-card);
+}
+
+.ui-stat-icon {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ui-stat-card--total .ui-stat-icon {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.ui-stat-card--open .ui-stat-icon {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.ui-stat-card--inprogress .ui-stat-icon {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+.ui-stat-card--resolved .ui-stat-icon {
+  background: #d1fae5;
+  color: #047857;
+}
+
+.ui-stat-body {
+  min-width: 0;
+}
+
+.ui-stat-title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ui-stat-value {
+  margin: 0.2rem 0 0;
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--color-text);
+  line-height: 1.1;
+}

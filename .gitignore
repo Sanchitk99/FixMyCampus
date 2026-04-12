@@ -1,0 +1,26 @@
+# Root gitignore for FixMyCampus monorepo
+# Ignore local env files and node/build artifacts
+.env
+**/.env
+node_modules/
+dist
+dist-ssr
+*.local
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+.DS_Store
+
+# Ignore nested git metadata to keep root repo clean
+**/.git
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

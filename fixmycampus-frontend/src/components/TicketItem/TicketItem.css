@@ -1,0 +1,74 @@
+.ticket-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #ffffff;
+  padding: 20px;
+  border-radius: 12px;
+  box-shadow: 0 2px 15px rgba(0, 0, 0, 0.08);
+  margin-bottom: 15px;
+  transition: all 0.3s ease;
+}
+
+.ticket-item:hover {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+}
+
+.ticket-title {
+  font-weight: 600;
+  color: #1e293b;
+  flex: 1;
+  font-size: 1.1rem;
+}
+
+.ticket-location {
+  color: #64748b;
+  flex: 1;
+  font-size: 1rem;
+}
+
+.ticket-status {
+  flex: 1;
+  font-size: 1rem;
+  font-weight: 500;
+  padding: 4px 8px;
+  border-radius: 6px;
+  text-align: center;
+}
+
+.ticket-status.open {
+  color: white;
+  background-color: #ef4444;
+}
+
+.ticket-status.resolved {
+  color: white;
+  background-color: #10b981;
+}
+
+.ticket-status.in-progress {
+  color: #1e293b;
+  background-color: #f59e0b;
+}
+
+.ticket-status.awaiting-confirmation {
+  color: #1e293b;
+  background-color: #a78bfa;
+}
+
+.ticket-status.closed {
+  color: white;
+  background-color: #10b981;
+}
+
+.ticket-status.reopened {
+  color: white;
+  background-color: #64748b;
+}
+
+.ticket-time {
+  color: #64748b;
+  flex: 1;
+  font-size: 0.9rem;
+  text-align: right;
+}
