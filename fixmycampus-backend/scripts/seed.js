@@ -1,7 +1,9 @@
-import "dotenv/config";
+import { loadEnv } from "../config/loadEnv.js";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import { connectDB, mongoTlsHint } from "../config/db.js";
+
+loadEnv();
 import { User } from "../models/User.js";
 import { Department } from "../models/Department.js";
 import { Category } from "../models/Category.js";
